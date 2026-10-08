@@ -7,7 +7,7 @@
   <a href="https://github.com/opensec-git/Pi-Bolt/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/opensec-git/Pi-Bolt/ci.yml?branch=pi-bolt&event=push&style=flat-square&label=ci" /></a>
   <a href="https://github.com/opensec-git/Pi-Bolt/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/opensec-git/Pi-Bolt?style=flat-square&color=2a78d6" /></a>
   <a href="https://www.npmjs.com/package/pi-bolt"><img alt="npm" src="https://img.shields.io/npm/v/pi-bolt?style=flat-square&logo=npm&logoColor=white&color=2a78d6" /></a>
-  <a href="https://github.com/earendil-works/pi/releases/tag/v1.0.4"><img alt="Pi 1.0.4" src="https://img.shields.io/badge/pi-1.0.4-f0b03a?style=flat-square" /></a>
+  <a href="https://github.com/earendil-works/pi/releases/tag/v1.1.0"><img alt="Pi 1.1.0" src="https://img.shields.io/badge/pi-1.1.0-f0b03a?style=flat-square" /></a>
   <a href="#requirements"><img alt="Linux x86-64" src="https://img.shields.io/badge/linux-x86--64-444?style=flat-square&logo=linux&logoColor=white" /></a>
   <a href="#requirements"><img alt="macOS Apple silicon" src="https://img.shields.io/badge/macOS-Apple%20silicon-444?style=flat-square&logo=apple&logoColor=white" /></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-1baf7a?style=flat-square" /></a>
@@ -233,7 +233,7 @@ to x86-64, brings it to macOS, and adds its own code-generation and runtime work
 
 ## The fork
 
-`packages/` is Pi at [v1.0.4](https://github.com/earendil-works/pi/releases/tag/v1.0.4), with Pi-Bolt's changes on top as
+`packages/` is Pi at [v1.1.0](https://github.com/earendil-works/pi/releases/tag/v1.1.0), with Pi-Bolt's changes on top as
 separate commits: how the terminal is drawn while answers stream, less work at startup, installing packages without npm, and
 messages that name the `pi-bolt` command. The commands, settings, sessions and extension API are Pi's. Pi-Bolt adds:
 
@@ -267,7 +267,7 @@ cd Pi-Bolt
 scripts/fetch-sources.sh            # WebKit and Bun at the pinned commits, with Pi-Bolt's patches
 scripts/toolchain/make-sysroot.sh   # glibc 2.17 sysroot with static ICU, for portable executables (Linux only)
 scripts/build-runtime.sh            # the Pi-Bolt Bun runtime
-scripts/prepare-pi.sh               # builds the Pi in this repository (1.0.4)
+scripts/prepare-pi.sh               # builds the Pi in this repository (1.1.0)
 scripts/build-pi.sh                 # out/pi-bolt/pi
 ```
 

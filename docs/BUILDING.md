@@ -119,7 +119,7 @@ A build without a profile works, with somewhat slower startup. `build-pi.sh` war
 
 ## Training profiles
 
-A profile ([`profiles/pi-1.0.4`](../profiles/pi-1.0.4)) has two files, recorded by running a plain bytecode build of Pi through
+A profile ([`profiles/pi-1.1.0`](../profiles/pi-1.1.0)) has two files, recorded by running a plain bytecode build of Pi through
 two scripted interactive sessions (`scripts/lib/train_session.py`). The first is a plain start and a few plain turns, and gives
 the order. The second is there for the regular expressions: an answer that uses every kind of Markdown and a code block in
 every language Pi highlights (`scripts/lib/training.md`), tool calls whose results the TUI renders, and the editor's
