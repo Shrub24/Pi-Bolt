@@ -254,6 +254,7 @@ in [`sources.json`](sources.json) with Pi-Bolt's changes on top; the engine chan
 | [Building](docs/BUILDING.md) | Building the runtime and Pi from source, training profiles, tests |
 | [Benchmarks](docs/BENCHMARKS.md) | Method, results and raw data |
 | [Plugins](docs/PLUGINS.md) | Porting Pi extensions and writing them for AOT |
+| [Nix](docs/NIX.md) | Compiled-in Nix plugins, the package overlay and Pi's Home Manager configuration |
 | [Editors](docs/ACP.md) | Pi-Bolt in Zed, JetBrains IDEs, VS Code and other ACP editors |
 | [Other agents](docs/MCP.md) | Pi-Bolt as a tool of other agents and MCP clients |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Diagnostics, environment variables, known limitations |

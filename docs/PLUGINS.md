@@ -97,6 +97,8 @@ An extension compiled in stands in for its installed copy while that copy is unc
 and off as always, and uses the compiled one instead of loading the files. An extension changed since (a package updated, a file
 edited) is loaded from its files, with a warning to run `pi-bolt compile` again. One removed or turned off is not loaded.
 
+With Nix, the flake builds the same way, with plugins chosen in Nix instead of found on the machine ([NIX.md](NIX.md)).
+
 It works in installations made with the installer, on Linux and macOS. On Windows, in Termux and with the npm package, build in
 a checkout of this repository ([below](#compile-in-the-plugins-you-already-have)). The [checklist](#compatibility-checklist)
 applies as to any compiled-in plugin; `--exclude` leaves out one the compiler refuses.

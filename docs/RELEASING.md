@@ -32,6 +32,9 @@ release key is a secret of the `release` environment, used only by `publish` run
    a draft; `publish` then signs it and publishes it. `tag` leaves a version without its release notes untagged.
 4. Try every install, looking for "signature verified": `curl -fsSL https://pi-bolt.opensec.in/install.sh | sh`,
    `npm install -g pi-bolt`, and on Windows `irm https://pi-bolt.opensec.in/install.ps1 | iex` (PowerShell) and `powershell -c "irm https://pi-bolt.opensec.in/install.ps1 | iex"` (Command Prompt).
+5. Nothing else: `publish` commits the Nix pin (`nix/release.json`) onto `pi-bolt` as it publishes, so the flake builds the
+   newest release. A staging run (`-f prerelease=true`) leaves the pin where it is, and `ci` fails when the pin and the latest
+   release disagree. By hand, or to redo it: `nix run .#update-release -- X.Y.Z`, then commit `nix/release.json`.
 
 By hand (with `AUTO_RELEASE` unset, or to redo a step): push the tag yourself
 (`git tag -a bolt-vX.Y.Z -m "Pi-Bolt X.Y.Z" && git push origin bolt-vX.Y.Z`), then, once the draft is there, run `publish` from

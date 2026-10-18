@@ -3,7 +3,8 @@ name: publish
 # Publishes a release the release workflow drafted: signs SHA256SUMS when the draft has no SHA256SUMS.sig yet, checks
 # SHA256SUMS.sig against keys/release.pub and that SHA256SUMS lists exactly the files of a release, each as it is
 # (scripts/check-release-files.sh, scripts/release-files.txt), publishes the GitHub release as the latest, puts install.sh,
-# install.ps1 and the site on gh-pages (https://pi-bolt.opensec.in), and publishes the npm packages.
+# install.ps1 and the site on gh-pages (https://pi-bolt.opensec.in), and publishes the npm packages. It also moves the Nix pin
+# (nix/release.json) onto the released version, so the flake builds the newest release instead of the one before it.
 #
 # Signing: the release key is the secret PIBOLT_SIGNING_KEY of the "release" environment, which only runs this workflow from
 # pi-bolt; it is used in one step below and nowhere else. What runs near it is pi-bolt's, not the tag's: the tag must be a commit
@@ -134,6 +135,35 @@ jobs:
             done
             [ -n "$served" ] || echo "::warning::pi-bolt.opensec.in does not serve this $installer yet"
           done
+
+  pin:
+    name: The Nix pin
+    needs: [verify, release]
+    # (A release staged as a pre-release is not what `releases/latest` names, so the pin stays where it is.)
+    if: github.event.inputs.prerelease != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # (The pin is a commit on pi-bolt.)
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      # pi-bolt as this run was started from it, with the token: the pin is a commit on it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: pi-bolt
+      - name: Repin
+        run: |
+          python3 nix/update-release.py "$VERSION"
+          if git diff --quiet -- nix/release.json; then echo "already pinned to $VERSION"; exit 0; fi
+          git config user.name "OpenSec"
+          git config user.email "323596076+opensec-intelligence@users.noreply.github.com"
+          git add nix/release.json
+          git commit -m "chore(release): the Nix pin follows Pi-Bolt $VERSION"
+          # (A push may have landed while this ran: rebase onto it and fail rather than push over it. ci's pin job reports the
+          # pin, so a run that fails here is visible.)
+          git pull --rebase origin pi-bolt
+          git push origin HEAD:pi-bolt
 
   npm:
     name: npm

@@ -1,8 +1,8 @@
 name: ci
 
 # Every push to pi-bolt and every pull request: lint and types, Pi's own tests, Pi-Bolt built and tested on Linux x86-64 and on
-# macOS on Apple silicon, the installers' checks of what they download (install.sh, and install.ps1 on Windows), and whether
-# the engine patches still apply.
+# macOS on Apple silicon, the installers' checks of what they download (install.sh, and install.ps1 on Windows), whether the
+# engine patches still apply, and whether the Nix pin still names the latest release.
 #
 # The runtime (patched WebKit and Bun) takes about an hour and 40 GB of disk to build, more than GitHub's runners give, so
 # Pi-Bolt is built here with the latest release's runtime (scripts/fetch-runtime.sh checks its signature). A change to the
@@ -58,6 +58,51 @@ jobs:
         run: npx biome check --error-on-warnings packages scripts
       - name: TypeScript
         run: npx tsc --noEmit
+
+  nix:
+    name: Nix on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
+      - name: Packages and plugin integration
+        run: nix flake check --print-build-logs
+
+  pin:
+    name: The Nix pin is the latest release
+    # (Only for a push: the pin names the release the flake builds, and publish moves it as it publishes. A pull request that
+    # changes it is checked by the push that lands it.)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The pin names the latest release
+        run: |
+          # (The repository rather than $GITHUB_REPOSITORY: the pin names this project's releases wherever it is built.)
+          release=https://github.com/opensec-git/Pi-Bolt/releases
+          latest=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$release/latest")
+          latest=${latest##*/bolt-v}
+          pin() { python3 -c "import json; print(json.load(open('nix/release.json'))['$1'])"; }
+          pinned=$(pin version)
+          if [ "$pinned" != "$latest" ]; then
+            echo "::error::nix/release.json pins Pi-Bolt $pinned and the latest release is $latest: run 'nix run .#update-release -- $latest' and commit nix/release.json"
+            exit 1
+          fi
+          stamp=$(curl -fsSL "$release/latest/download/RUNTIME_STAMP")
+          pinned_stamp=$(pin runtimeStamp)
+          if [ "$pinned_stamp" != "$stamp" ]; then
+            echo "::error::nix/release.json pins runtime $pinned_stamp and release $latest has $stamp: run 'nix run .#update-release -- $latest' and commit nix/release.json"
+            exit 1
+          fi
+          echo "pinned to Pi-Bolt $latest, runtime $stamp"
 
   unit:
     name: Pi's tests
