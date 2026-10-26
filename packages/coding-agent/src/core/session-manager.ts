@@ -11,7 +11,7 @@ import {
 	type UserMessage,
 	uuidv7,
 } from "@earendil-works/pi-ai";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import {
 	appendFileSync,
 	closeSync,
@@ -351,22 +351,120 @@ export function migrateSessionEntries(entries: FileEntry[]): void {
 	migrateToCurrentVersion(entries);
 }
 
-/** Exported for compaction.test.ts */
-export function parseSessionEntries(content: string): FileEntry[] {
-	const entries: FileEntry[] = [];
-	const lines = content.trim().split("\n");
+/** `type` of the storage-only record that holds one system snapshot body. It is never a session entry. */
+const SYSTEM_SNAPSHOT_RECORD_TYPE = "pi-bolt:system-snapshot";
+/** Version of the snapshot record format. Readers reject other versions rather than guess. */
+const SYSTEM_SNAPSHOT_RECORD_VERSION = 1;
 
-	for (const line of lines) {
-		if (!line.trim()) continue;
-		try {
-			const entry = JSON.parse(line) as FileEntry;
-			entries.push(entry);
-		} catch {
-			// Skip malformed lines
+/** A system message without its boundary timestamp: the part shared by every compaction in the same state. */
+type SystemSnapshotBody = Omit<SystemMessage, "timestamp">;
+
+/** Written once per distinct body in a session file, before the first compaction that references it. */
+interface SystemSnapshotRecord {
+	type: typeof SYSTEM_SNAPSHOT_RECORD_TYPE;
+	version: number;
+	/** `sha256:` followed by the hex digest of the JSON-serialised body. */
+	id: string;
+	message: SystemSnapshotBody;
+}
+
+/** A compaction as written to disk: its snapshot is a reference to a body record earlier in the same file. */
+interface StoredCompactionEntry extends CompactionEntry {
+	systemMessageRef?: string;
+}
+
+/** A line after the header as read from disk, before snapshot references are resolved. */
+type StoredSessionRecord = Exclude<FileEntry, CompactionEntry> | StoredCompactionEntry | SystemSnapshotRecord;
+
+/** A session file as read: its entries with snapshots inline, and the ids of the snapshot bodies it stores. */
+interface LoadedSessionFile {
+	entries: FileEntry[];
+	snapshotIds: Set<string>;
+}
+
+function snapshotBodyOf(message: SystemMessage): SystemSnapshotBody {
+	const { timestamp: _boundary, ...body } = message;
+	return body;
+}
+
+function snapshotBodyId(body: SystemSnapshotBody): string {
+	return `sha256:${createHash("sha256").update(JSON.stringify(body)).digest("hex")}`;
+}
+
+/**
+ * The file text for one entry. A compaction's inline snapshot is written as a reference. Its body record precedes the
+ * reference unless `written` already holds that body; `body` names a body the text defines, for the caller to record
+ * once the text is written.
+ */
+function encodeSessionEntry(entry: FileEntry, written: ReadonlySet<string>): { text: string; body?: string } {
+	if (entry.type !== "compaction" || !entry.systemMessage) return { text: `${JSON.stringify(entry)}\n` };
+	const { systemMessage, ...compaction } = entry;
+	const body = snapshotBodyOf(systemMessage);
+	const id = snapshotBodyId(body);
+	const stored: StoredCompactionEntry = { ...compaction, systemMessageRef: id };
+	if (written.has(id)) return { text: `${JSON.stringify(stored)}\n` };
+	const record: SystemSnapshotRecord = {
+		type: SYSTEM_SNAPSHOT_RECORD_TYPE,
+		version: SYSTEM_SNAPSHOT_RECORD_VERSION,
+		id,
+		message: body,
+	};
+	return { text: `${JSON.stringify(record)}\n${JSON.stringify(stored)}\n`, body: id };
+}
+
+/**
+ * Resolves the snapshot references of a file's records into inline `systemMessage` fields. Fails rather than return a
+ * compaction whose snapshot cannot be restored: the prompt and tools are part of the compacted state.
+ */
+function decodeSessionRecords(records: StoredSessionRecord[], source: string): LoadedSessionFile {
+	const bodies = new Map<string, SystemSnapshotBody>();
+	const entries: FileEntry[] = [];
+	for (const record of records) {
+		if (record.type === SYSTEM_SNAPSHOT_RECORD_TYPE) {
+			if (record.version !== SYSTEM_SNAPSHOT_RECORD_VERSION) {
+				throw new Error(
+					`Session ${source} has an unsupported system snapshot record version: ${String(record.version)}`,
+				);
+			}
+			if (typeof record.message !== "object" || record.message === null || record.message.role !== "system") {
+				throw new Error(`Session ${source} has a malformed system snapshot record: ${record.id}`);
+			}
+			if (snapshotBodyId(record.message) !== record.id) {
+				throw new Error(`Session ${source} has a system snapshot whose contents do not match its id: ${record.id}`);
+			}
+			bodies.set(record.id, record.message);
+		} else if (record.type === "compaction") {
+			const { systemMessageRef, ...compaction } = record;
+			if (systemMessageRef === undefined || record.systemMessage) {
+				entries.push(compaction);
+				continue;
+			}
+			const body = bodies.get(systemMessageRef);
+			if (!body) {
+				throw new Error(
+					`Session ${source}: compaction ${record.id} references system snapshot ${systemMessageRef}, which is not defined before it`,
+				);
+			}
+			const timestamp = new Date(compaction.timestamp).getTime();
+			if (Number.isNaN(timestamp)) {
+				throw new Error(`Session ${source}: compaction ${record.id} has an invalid timestamp`);
+			}
+			entries.push({ ...compaction, systemMessage: { ...body, timestamp } });
+		} else {
+			entries.push(record);
 		}
 	}
+	return { entries, snapshotIds: new Set(bodies.keys()) };
+}
 
-	return entries;
+/** Exported for compaction.test.ts */
+export function parseSessionEntries(content: string): FileEntry[] {
+	const records: StoredSessionRecord[] = [];
+	for (const line of content.trim().split("\n")) {
+		const record = parseSessionRecordLine(line);
+		if (record) records.push(record);
+	}
+	return decodeSessionRecords(records, "content").entries;
 }
 
 export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
@@ -625,12 +723,26 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 	}
 }
 
+function parseSessionRecordLine(line: string): StoredSessionRecord | null {
+	if (!line.trim()) return null;
+	try {
+		return JSON.parse(line) as StoredSessionRecord;
+	} catch {
+		// Skip malformed lines
+		return null;
+	}
+}
+
 /** Exported for testing */
 export function loadEntriesFromFile(filePath: string): FileEntry[] {
-	const resolvedFilePath = normalizePath(filePath);
-	if (!existsSync(resolvedFilePath)) return [];
+	return loadSessionFile(filePath).entries;
+}
 
-	const entries: FileEntry[] = [];
+function loadSessionFile(filePath: string): LoadedSessionFile {
+	const resolvedFilePath = normalizePath(filePath);
+	if (!existsSync(resolvedFilePath)) return { entries: [], snapshotIds: new Set() };
+
+	const records: StoredSessionRecord[] = [];
 	let pending = "";
 	const fd = openSync(resolvedFilePath, "r");
 	try {
@@ -645,8 +757,8 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 			let lineStart = 0;
 			let newlineIndex = pending.indexOf("\n", lineStart);
 			while (newlineIndex !== -1) {
-				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex));
-				if (entry) entries.push(entry);
+				const record = parseSessionRecordLine(pending.slice(lineStart, newlineIndex));
+				if (record) records.push(record);
 				lineStart = newlineIndex + 1;
 				newlineIndex = pending.indexOf("\n", lineStart);
 			}
@@ -654,21 +766,22 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		}
 
 		pending += decoder.end();
-		const finalEntry = parseSessionEntryLine(pending);
-		if (finalEntry) entries.push(finalEntry);
+		const finalRecord = parseSessionRecordLine(pending);
+		if (finalRecord) records.push(finalRecord);
 	} finally {
 		closeSync(fd);
 	}
 
 	// Validate session header before repairing the file.
-	if (entries.length === 0) return entries;
-	const header = entries[0];
+	if (records.length === 0) return { entries: [], snapshotIds: new Set() };
+	const header = records[0];
 	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
-		return [];
+		return { entries: [], snapshotIds: new Set() };
 	}
 
+	const loaded = decodeSessionRecords(records, resolvedFilePath);
 	if (pending) appendFileSync(resolvedFilePath, "\n");
-	return entries;
+	return loaded;
 }
 
 /**
@@ -1389,6 +1502,8 @@ export class SessionManager {
 	private latestSessionInfo: SessionInfoEntry | undefined;
 	/** The session file, kept open between appends that come in quick succession. Not used on Windows. */
 	private appendFile: SessionAppendFile | undefined;
+	/** Ids of the snapshot bodies already stored in the session file, so a repeated state is referenced, not stored again. */
+	private writtenSnapshotIds: Set<string> = new Set();
 
 	private constructor(
 		cwd: string,
@@ -1396,7 +1511,7 @@ export class SessionManager {
 		sessionFile: string | undefined,
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
-		preloadedFileEntries?: FileEntry[],
+		preloaded?: LoadedSessionFile,
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
@@ -1406,9 +1521,9 @@ export class SessionManager {
 		}
 
 		if (sessionFile) {
-			this._setSessionFile(sessionFile, preloadedFileEntries);
-		} else if (preloadedFileEntries?.length) {
-			this._loadEntries(preloadedFileEntries, newSessionOptions);
+			this._setSessionFile(sessionFile, preloaded);
+		} else if (preloaded?.entries.length) {
+			this._loadEntries(preloaded, newSessionOptions);
 		} else {
 			this.newSession(newSessionOptions);
 		}
@@ -1419,11 +1534,12 @@ export class SessionManager {
 		this._setSessionFile(sessionFile);
 	}
 
-	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+	private _setSessionFile(sessionFile: string, preloaded?: LoadedSessionFile): void {
 		this._closeAppendFile();
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
-			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
+			const loaded = preloaded ?? loadSessionFile(this.sessionFile);
+			const entries = loaded.entries;
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
@@ -1439,7 +1555,7 @@ export class SessionManager {
 				return;
 			}
 
-			this._loadEntries(entries);
+			this._loadEntries(loaded);
 			this.flushed = true;
 		} else {
 			const explicitPath = this.sessionFile;
@@ -1480,12 +1596,14 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
-	private _loadEntries(entries: FileEntry[], options?: NewSessionOptions): void {
+	private _loadEntries(loaded: LoadedSessionFile, options?: NewSessionOptions): void {
+		const { entries } = loaded;
 		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
 
 		if (header) {
 			this.fileEntries = entries;
 			this.sessionId = header.id;
+			this.writtenSnapshotIds = loaded.snapshotIds;
 
 			if (migrateToCurrentVersion(this.fileEntries)) {
 				this._rewriteFile();
@@ -1526,9 +1644,12 @@ export class SessionManager {
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		const fd = openSync(this.sessionFile, "w");
+		this.writtenSnapshotIds = new Set();
 		try {
 			for (const entry of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+				const encoded = encodeSessionEntry(entry, this.writtenSnapshotIds);
+				writeFileSync(fd, encoded.text);
+				if (encoded.body) this.writtenSnapshotIds.add(encoded.body);
 			}
 		} finally {
 			closeSync(fd);
@@ -1576,17 +1697,23 @@ export class SessionManager {
 
 		if (!this.flushed) {
 			if (!this._hasConversation()) return;
+			const written = new Set<string>();
 			const fd = openSync(this.sessionFile, "wx");
 			try {
 				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
+					const encoded = encodeSessionEntry(e, written);
+					writeFileSync(fd, encoded.text);
+					if (encoded.body) written.add(encoded.body);
 				}
 			} finally {
 				closeSync(fd);
 			}
+			this.writtenSnapshotIds = written;
 			this.flushed = true;
 		} else {
-			this._appendLine(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			const encoded = encodeSessionEntry(entry, this.writtenSnapshotIds);
+			this._appendLine(this.sessionFile, encoded.text);
+			if (encoded.body) this.writtenSnapshotIds.add(encoded.body);
 		}
 	}
 
@@ -2268,7 +2395,7 @@ export class SessionManager {
 	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
 		const resolvedPath = resolvePath(path);
 		let header: SessionHeader | null = null;
-		let preloadedFileEntries: FileEntry[] | undefined;
+		let preloaded: LoadedSessionFile | undefined;
 		if (cwdOverride === undefined && existsSync(resolvedPath)) {
 			try {
 				header = readSessionHeader(resolvedPath);
@@ -2276,15 +2403,15 @@ export class SessionManager {
 				if (!(error instanceof SessionHeaderScanLimitError)) throw error;
 				// The bounded scan is only a discovery optimization. A full load remains
 				// authoritative for legacy files with very large headers or prefixes.
-				preloadedFileEntries = loadEntriesFromFile(resolvedPath);
-				const firstEntry = preloadedFileEntries[0];
+				preloaded = loadSessionFile(resolvedPath);
+				const firstEntry = preloaded.entries[0];
 				header = firstEntry?.type === "session" ? firstEntry : null;
 			}
 		}
 		const cwd = cwdOverride ?? (header ? getSessionHeaderCwd(header) : undefined) ?? process.cwd();
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
-		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries);
+		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloaded);
 	}
 
 	/**
@@ -2304,7 +2431,7 @@ export class SessionManager {
 
 	/** Create an in-memory session (no file persistence), optionally from entries held outside the filesystem. */
 	static inMemory(cwd: string = process.cwd(), options?: NewSessionOptions, entries?: FileEntry[]): SessionManager {
-		return new SessionManager(cwd, "", undefined, false, options, entries);
+		return new SessionManager(cwd, "", undefined, false, options, entries && { entries, snapshotIds: new Set() });
 	}
 
 	/**
@@ -2360,9 +2487,12 @@ export class SessionManager {
 		const fd = openSync(newSessionFile, "wx");
 		try {
 			writeFileSync(fd, `${JSON.stringify(newHeader)}\n`);
+			const written = new Set<string>();
 			for (const entry of sourceEntries) {
 				if (entry.type !== "session") {
-					writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+					const encoded = encodeSessionEntry(entry, written);
+					writeFileSync(fd, encoded.text);
+					if (encoded.body) written.add(encoded.body);
 				}
 			}
 		} finally {
