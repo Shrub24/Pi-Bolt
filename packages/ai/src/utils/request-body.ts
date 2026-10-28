@@ -32,9 +32,13 @@
  *
  * Conversations are told apart by a key (the session id); the last few keep their previous request's snapshots and
  * bytes, about one request's size each. A conversation not seen in the latest requests is dropped.
+ *
+ * An item that request-cache.ts handed out (a message converted for an earlier request and reused; nothing changes it)
+ * is sent as the bytes it was first sent as, without a comparison.
  */
 
 import { cachedArrayToJSON, cacheJsonSerialization } from "./json-body.ts";
+import type { RequestCacheRun, SentValues } from "./request-cache.ts";
 
 const { isRawJSON } = JSON as unknown as { isRawJSON?: (value: unknown) => boolean };
 
@@ -195,6 +199,7 @@ export function jsonBodyParts(
 	key: string,
 	conversation: string,
 	allowedToJSON?: unknown,
+	sent?: SentValues,
 ): Bytes[] | undefined {
 	const items = body[key];
 	if (!Array.isArray(items) || !isPlainItems(items, allowedToJSON) || !isPlainRecord(body) || hasToJSON(body)) {
@@ -221,6 +226,15 @@ export function jsonBodyParts(
 	for (let i = 0; i < items.length; i++) {
 		const item = items[i];
 		const previous = state.snapshots[i];
+		// A value request-cache.ts handed out: the bytes it was first sent as, made below the first time.
+		const cached = sent?.bytes(item);
+		if (cached) {
+			bytes[i] = cached;
+			snapshots[i] = UNCACHEABLE;
+			if (i > 0) parts.push(COMMA);
+			parts.push(cached);
+			continue;
+		}
 		if (previous !== undefined && previous !== UNCACHEABLE && matches(previous, item)) {
 			snapshots[i] = previous;
 			bytes[i] = state.bytes[i];
@@ -228,6 +242,10 @@ export function jsonBodyParts(
 			// An item that serializes to nothing (undefined, a function) is null in an array.
 			bytes[i] = utf8(JSON.stringify(item) ?? "null");
 			snapshots[i] = snapshot(item);
+		}
+		if (cached === null) {
+			sent?.keep(bytes[i]);
+			snapshots[i] = UNCACHEABLE;
 		}
 		if (i > 0) parts.push(COMMA);
 		parts.push(bytes[i]);
@@ -247,6 +265,7 @@ interface Registration {
 	key: string;
 	conversation: string;
 	allowedToJSON: unknown;
+	cache: RequestCacheRun | undefined;
 }
 
 type BuildBody = (
@@ -300,12 +319,13 @@ export function sendJsonBodyAsBytes(
 	key: "messages" | "input",
 	conversation: string | undefined,
 	allowedToJSON?: unknown,
+	cache?: RequestCacheRun,
 ): void {
 	if (typeof client !== "object" || client === null || !Array.isArray(items)) return;
 	const target = client as { buildBody?: unknown };
 	const original = target.buildBody;
 	if (typeof original !== "function" || typeof Blob !== "function") return;
-	registered.set(items, { key, conversation: conversation ?? "", allowedToJSON });
+	registered.set(items, { key, conversation: conversation ?? "", allowedToJSON, cache });
 	if (wrappedClients.has(client)) return;
 	const buildBody = original as BuildBody;
 	try {
@@ -323,6 +343,7 @@ export function sendJsonBodyAsBytes(
 								registration.key,
 								registration.conversation,
 								registration.allowedToJSON,
+								registration.cache?.sentValues(),
 							);
 							if (parts) return { ...probe, body: new Blob(parts) };
 						}
@@ -344,14 +365,16 @@ export function sendJsonBodyAsBytes(
 
 /**
  * Prepares a request's `items` (body[key]) for serialization: long strings reuse their JSON (json-body.ts), and the
- * body is sent as bytes that reuse the conversation's previous request (sendJsonBodyAsBytes).
+ * body is sent as bytes that reuse the conversation's previous request (sendJsonBodyAsBytes) and, with `cache` (the
+ * request's run of request-cache.ts), the bytes of the values the run handed out.
  */
 export function cacheRequestBody(
 	client: unknown,
 	items: unknown,
 	key: "messages" | "input",
 	conversation: string | undefined,
+	cache?: RequestCacheRun,
 ): void {
 	cacheJsonSerialization(items);
-	sendJsonBodyAsBytes(client, items, key, conversation, cachedArrayToJSON);
+	sendJsonBodyAsBytes(client, items, key, conversation, cachedArrayToJSON, cache);
 }
