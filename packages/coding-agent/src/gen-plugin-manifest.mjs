@@ -785,8 +785,9 @@ function importsByName(previous, source, end) {
  * The same goes for what the bundler resolves per module against the copy, which `pi-bolt compile` deletes, or leaves to
  * resolve as the program runs from the executable's own file system, `/$bunfs` (#5 of the loader-parity review): `__dirname`
  * and `__filename` (a data file, or a native addon loaded as node-gyp-build and bindings load one), `require.resolve()`,
- * `import.meta.resolve()`, and a require() or an import() of anything but a string (a module chosen as it runs). Each is
- * replaced with what it is for the file the copy was made from, so it finds what the installed extension finds. A module
+ * `import.meta.resolve()`, and a require() or an import() of anything but a string (a module chosen as it runs, `"./" + name`
+ * too: callOfExpression). Each is replaced with what it is for the file the copy was made from, so it finds what the
+ * installed extension finds. A module
  * that declares `__dirname`, `__filename` or `require` itself keeps its own. `import.meta.main` and the like are left alone.
  */
 
@@ -803,8 +804,46 @@ const IMPORT_META_AT = new RegExp(`import\\s*\\.\\s*meta\\s*\\.\\s*(${Object.key
 const IMPORT_META_RESOLVE_AT = /import\s*\.\s*meta\s*\.\s*resolve(?![\w$])/y;
 /** `.resolve` after `require`. */
 const REQUIRE_RESOLVE_AT = /\s*\.\s*resolve(?![\w$])/y;
-/** The `(` of a call whose first argument is not a string or a template literal, which the bundler resolves itself. */
-const CALL_OF_EXPRESSION_AT = /\s*\((?=\s*[^\s"'`)])/y;
+/** The `(` of a call. */
+const OPEN_AT = /\s*\(/y;
+/** White space, and after a string also comments, up to what follows them. */
+const SPACE_AT = /\s*/y;
+const SPACE_OR_COMMENT_AT = /(?:\s|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*/y;
+const QUOTES = new Set(['"', "'", "`"]);
+
+/**
+ * Where the arguments begin (just after the `(`) of a call of `import` or `require` that ends at `at` in `source`, when the
+ * bundler leaves its specifier as it is: anything but one string literal (or a template literal without `${}`) followed by
+ * the end of the arguments, or by `,` and an import's options. Undefined for a call of a string, which the bundler resolves,
+ * for `()`, and when no `(` follows.
+ *
+ * A specifier built from a string, `"./" + id + ".js"` or `` `./${id}.js` ``, is an expression too: the bundler bundles
+ * neither, nor any file it may name, and leaves it to resolve as the program runs from the executable's own file system,
+ * where there is no such file. A webpack build loads its split chunks that way (`import("./" + __webpack_require__.u(id))`):
+ * @cursor/sdk/sqlite's ESM build failed with "Cannot find module './19.js'" once compiled in (#193).
+ */
+function callOfExpression(source, at) {
+	OPEN_AT.lastIndex = at;
+	if (!OPEN_AT.exec(source)) return undefined;
+	const open = OPEN_AT.lastIndex;
+	SPACE_AT.lastIndex = open;
+	SPACE_AT.exec(source);
+	const quote = source[SPACE_AT.lastIndex];
+	if (quote === undefined || quote === ")") return undefined;
+	if (!QUOTES.has(quote)) return open;
+	let i = SPACE_AT.lastIndex + 1;
+	for (; i < source.length && source[i] !== quote; i++) {
+		if (source[i] === "\\") i++;
+		else if (quote === "`" && source[i] === "$" && source[i + 1] === "{") return open;
+		// (A string ends at the end of its line at the latest, as the scanner takes it.)
+		else if (source[i] === "\n" && quote !== "`") return undefined;
+	}
+	if (i >= source.length) return undefined;
+	SPACE_OR_COMMENT_AT.lastIndex = i + 1;
+	SPACE_OR_COMMENT_AT.exec(source);
+	const after = source[SPACE_OR_COMMENT_AT.lastIndex];
+	return after === ")" || after === "," ? undefined : open;
+}
 
 /** Pi's names for its own modules, which Pi gives an extension whatever it has installed (VIRTUAL_MODULES). */
 const PI_MODULE = "/^(?:typebox|@sinclair\\/typebox|@(?:earendil-works|mariozechner)\\/pi-(?:agent-core|ai|coding-agent|tui))(?:\\/|$)/";
@@ -1127,10 +1166,9 @@ export function rewriteCopy(source, file) {
 					continue;
 				}
 				// (An import() of anything but a string: from the installed file, not from the executable's file system.)
-				CALL_OF_EXPRESSION_AT.lastIndex = i;
-				const call = CALL_OF_EXPRESSION_AT.exec(source);
-				if (call && !isMethod(i + call[0].length - 1)) {
-					replace(i + call[0].length, `((s, o) => import(${resolveFrom(file)}(s), o))(`);
+				const open = callOfExpression(source, i);
+				if (open !== undefined && !isMethod(open - 1)) {
+					replace(open, `((s, o) => import(${resolveFrom(file)}(s), o))(`);
 					continue;
 				}
 			}
@@ -1150,10 +1188,9 @@ export function rewriteCopy(source, file) {
 					replace(i + resolveMatch[0].length, `${requireFrom(file)}.resolve`);
 					continue;
 				}
-				CALL_OF_EXPRESSION_AT.lastIndex = i;
-				const call = CALL_OF_EXPRESSION_AT.exec(source);
-				if (call && !isMethod(i + call[0].length - 1)) {
-					replace(i + call[0].length, `${requireFrom(file)}(`);
+				const open = callOfExpression(source, i);
+				if (open !== undefined && !isMethod(open - 1)) {
+					replace(open, `${requireFrom(file)}(`);
 					continue;
 				}
 			}
