@@ -4,7 +4,7 @@ import { streamSimple as streamOpenAICompletions } from "../src/api/openai-compl
 import { streamSimple as streamOpenAIResponses } from "../src/api/openai-responses.ts";
 import type { Api, FetchFunction, Message, Model, TranscriptContext } from "../src/types.ts";
 import { cacheJsonSerialization } from "../src/utils/json-body.ts";
-import { jsonBodyParts } from "../src/utils/request-body.ts";
+import { jsonBodyParts, RUNTIME_FETCH_WRAPPER } from "../src/utils/request-body.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const long = (seed: string, length = 3000) => seed.repeat(Math.ceil(length / seed.length)).slice(0, length);
@@ -338,6 +338,33 @@ describe("request bodies sent as bytes", () => {
 		});
 		await adapters[0][1](normalizeContext({ messages: turn(0) }), fetch, () => undefined);
 		expect(typeof sent).toBe("string");
+	});
+
+	// The HTTP idle timeout fetch Pi installs on Bun (#206) wraps the runtime's fetch and names it.
+	it("sends bytes through a wrapper that names the runtime's fetch, and the string through one that names another", async () => {
+		const sent: unknown[] = [];
+		const inner = vi.fn<FetchFunction>(async (_url, init) => {
+			sent.push(init?.body);
+			return new Response("{}", { status: 400 });
+		});
+		const wrap = (wrapped: FetchFunction): FetchFunction => {
+			const wrapper: FetchFunction = (input, init) => wrapped(input, init);
+			return Object.defineProperty(wrapper, RUNTIME_FETCH_WRAPPER, { value: wrapped });
+		};
+		const context = normalizeContext({ messages: turn(0) });
+		await adapters[0][1](context, wrap(runtimeLikeFetch(inner)), () => undefined);
+		await adapters[0][1](context, wrap(inner), () => undefined);
+		// A wrapper that names itself is not the runtime's fetch either.
+		const self: FetchFunction = (input, init) => inner(input, init);
+		await adapters[0][1](
+			context,
+			Object.defineProperty(self, RUNTIME_FETCH_WRAPPER, { value: self }),
+			() => undefined,
+		);
+		expect(sent[0]).toBeInstanceOf(Blob);
+		expect(await (sent[0] as Blob).text()).toBe(sent[1]);
+		expect(typeof sent[1]).toBe("string");
+		expect(typeof sent[2]).toBe("string");
 	});
 
 	for (const [name, run] of adapters) {

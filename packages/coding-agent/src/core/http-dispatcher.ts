@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
+import { RUNTIME_FETCH_WRAPPER } from "@earendil-works/pi-ai/utils/request-body";
 import type * as Undici from "undici";
 import { isBundledNode, isBunRuntime } from "../config.ts";
 
@@ -90,14 +91,124 @@ function createUndiciOriginDispatcher(origin: string | URL, options: object): Un
 	);
 }
 
+/** Bun's fetch options: `timeout: false` turns off its own idle timer for the request. */
+interface BunRequestInit extends RequestInit {
+	timeout?: boolean;
+}
+
+// Statuses whose response cannot be constructed with a body.
+const NULL_BODY_STATUSES: ReadonlySet<number> = new Set([101, 103, 204, 205, 304]);
+
+function idleTimeoutError(timeoutMs: number): DOMException {
+	return new DOMException(`No data from the server for ${timeoutMs / 1000} s (HTTP idle timeout)`, "TimeoutError");
+}
+
+/**
+ * Body of `response` that fails with a TimeoutError, and aborts the request through `controller`, when a read waits
+ * longer than `timeoutMs` for the server. Time the consumer spends between reads does not count.
+ */
+function withBodyIdleTimeout(response: Response, controller: AbortController, timeoutMs: number): Response {
+	const reader = (response.body as ReadableStream<Uint8Array>).getReader();
+	let timedOut: DOMException | undefined;
+	const body = new ReadableStream<Uint8Array>({
+		async pull(streamController) {
+			const timer = setTimeout(() => {
+				timedOut = idleTimeoutError(timeoutMs);
+				controller.abort(timedOut);
+			}, timeoutMs);
+			let result: Awaited<ReturnType<typeof reader.read>>;
+			try {
+				result = await reader.read();
+			} catch (error) {
+				throw timedOut ?? error;
+			} finally {
+				clearTimeout(timer);
+			}
+			if (timedOut) throw timedOut;
+			if (result.done) streamController.close();
+			else streamController.enqueue(result.value);
+		},
+		cancel(reason) {
+			return reader.cancel(reason);
+		},
+	});
+	const wrapped = new Response(body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+	});
+	Object.defineProperties(wrapped, {
+		url: { value: response.url },
+		redirected: { value: response.redirected },
+	});
+	return wrapped;
+}
+
+/**
+ * Bun's fetch with the HTTP idle timeout applied as undici's headersTimeout and bodyTimeout apply it on Node: no
+ * response headers within `timeoutMs`, or a body read that waits longer than `timeoutMs`, fails the request; 0 waits
+ * forever. Bun's own idle timer is turned off for the request: it does not read this setting (5 minutes, or
+ * BUN_CONFIG_HTTP_IDLE_TIMEOUT), so "disabled" or a longer timeout still failed after about 6 minutes (#206).
+ */
+export function createBunIdleTimeoutFetch(
+	bunFetch: typeof globalThis.fetch,
+	timeoutMs: number,
+): typeof globalThis.fetch {
+	const idleTimeoutFetch = async (
+		input: Parameters<typeof globalThis.fetch>[0],
+		init?: RequestInit,
+	): Promise<Response> => {
+		// A caller's own `timeout` option wins.
+		const bunInit: BunRequestInit = { timeout: false, ...init };
+		if (timeoutMs === 0) return bunFetch(input, bunInit);
+		const controller = new AbortController();
+		const callerSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+		bunInit.signal = callerSignal ? AbortSignal.any([callerSignal, controller.signal]) : controller.signal;
+		const timer = setTimeout(() => controller.abort(idleTimeoutError(timeoutMs)), timeoutMs);
+		let response: Response;
+		try {
+			response = await bunFetch(input, bunInit);
+		} finally {
+			clearTimeout(timer);
+		}
+		if (!response.body || NULL_BODY_STATUSES.has(response.status)) return response;
+		return withBodyIdleTimeout(response, controller, timeoutMs);
+	};
+	// The request body reaches `bunFetch` unchanged, so pi-ai still sends it as the bytes it keeps between requests
+	// when `bunFetch` is the runtime's own.
+	Object.defineProperty(idleTimeoutFetch, RUNTIME_FETCH_WRAPPER, { value: bunFetch });
+	// Keep Bun's fetch.preconnect (see connection-warmer.ts).
+	const preconnect = (bunFetch as { preconnect?: unknown }).preconnect;
+	if (typeof preconnect === "function") Object.assign(idleTimeoutFetch, { preconnect: preconnect.bind(bunFetch) });
+	return idleTimeoutFetch as typeof globalThis.fetch;
+}
+
+/**
+ * Bun's fetch does not use undici dispatchers (its "undici" module is a stand-in whose global dispatcher nothing
+ * reads), so the idle timeout is applied by wrapping the global fetch. Bun's own idle timer already is 5 minutes, the
+ * default, so with the default the global fetch stays Bun's own, at no cost per request.
+ */
+function configureBunFetch(timeoutMs: number): void {
+	const current = globalThis.fetch;
+	if (current !== originalGlobalFetch && current !== installedGlobalFetch) return;
+	if (timeoutMs === DEFAULT_HTTP_IDLE_TIMEOUT_MS) {
+		globalThis.fetch = originalGlobalFetch;
+		installedGlobalFetch = undefined;
+		return;
+	}
+	installedGlobalFetch = createBunIdleTimeoutFetch(originalGlobalFetch, timeoutMs);
+	globalThis.fetch = installedGlobalFetch;
+}
+
 export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TIMEOUT_MS): void {
 	const normalizedTimeoutMs = parseHttpIdleTimeoutMs(timeoutMs);
 	if (normalizedTimeoutMs === undefined) {
 		throw new Error(`Invalid HTTP idle timeout: ${String(timeoutMs)}`);
 	}
-	// Bun's fetch does not use undici dispatchers (its "undici" module is a stand-in whose global dispatcher nothing
-	// reads), so there is nothing to configure.
-	if (isBunRuntime) return;
+	if (isBunRuntime) {
+		configureBunFetch(normalizedTimeoutMs);
+		return;
+	}
 	const dispatcher = withUndiciErrorListener(
 		new (undici().EnvHttpProxyAgent)({
 			allowH2: false,
