@@ -26,7 +26,7 @@ function tempDir(): string {
 
 /** A Herdr socket that answers every request (by default, that it took it) and keeps what it got. */
 async function fakeHerdr(
-	answer: (request: Request) => Record<string, unknown> = () => ({ result: {} }),
+	answer: (request: Request) => Record<string, unknown> | Promise<Record<string, unknown>> = () => ({ result: {} }),
 ): Promise<{ socketPath: string; requests: Request[] }> {
 	const socketPath = join(tempDir(), "herdr.sock");
 	const requests: Request[] = [];
@@ -38,7 +38,9 @@ async function fakeHerdr(
 				const request = JSON.parse(buffered.slice(0, newline)) as Request;
 				buffered = buffered.slice(newline + 1);
 				requests.push(request);
-				socket.write(`${JSON.stringify({ id: request.id, ...answer(request) })}\n`);
+				void Promise.resolve(answer(request)).then((reply) =>
+					socket.write(`${JSON.stringify({ id: request.id, ...reply })}\n`),
+				);
 			}
 		});
 	});
@@ -89,7 +91,11 @@ async function until(check: () => boolean) {
 }
 
 async function startedInHerdr(
-	options: { mode?: string; sessionFile?: string; answer?: (request: Request) => Record<string, unknown> } = {},
+	options: {
+		mode?: string;
+		sessionFile?: string;
+		answer?: (request: Request) => Record<string, unknown> | Promise<Record<string, unknown>>;
+	} = {},
 ) {
 	const herdr = await fakeHerdr(options.answer);
 	const env = { HERDR_ENV: "1", HERDR_SOCKET_PATH: herdr.socketPath, HERDR_PANE_ID: "w1:p2" };
@@ -273,6 +279,29 @@ describe("Herdr extension", () => {
 		await run.fire("ui_prompt_end", { type: "ui_prompt_end", reason: "ui_prompt", kind: "select" });
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		expect(run.states()).toEqual(["idle", "idle", "idle"]);
+	});
+
+	// #200 (PR #214 review): a report refused after the release on quit was tried again with a seq above the release's,
+	// which took the pane back.
+	test("nothing is reported after the release on quit", async () => {
+		let releaseArrived: (() => void) | undefined;
+		const refused = { error: { code: "resume_not_accepted", message: "report rejected" } };
+		const run = await startedInHerdr({
+			// The first report is refused only once the release is in.
+			answer: (request) => {
+				if (request.method === "pane.release_agent") {
+					setTimeout(() => releaseArrived?.(), 0);
+					return { result: {} };
+				}
+				return new Promise((resolve) => {
+					releaseArrived = () => resolve(refused);
+				});
+			},
+		});
+		await until(() => run.herdr.requests.length === 1);
+		await run.fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(run.herdr.requests.map((r) => r.method)).toEqual(["pane.report_agent", "pane.release_agent"]);
 	});
 
 	test("pi-herdr's own report of the pane is turned off in Herdr only", () => {

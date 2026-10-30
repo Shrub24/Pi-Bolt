@@ -35,10 +35,15 @@ export function quietOtherHerdrReporters(env: NodeJS.ProcessEnv = process.env): 
 
 /**
  * Two tries; true when Herdr took the report. Each try gets its own seq: Herdr may have applied a try whose answer was
- * lost, and would then refuse the same seq again.
+ * lost, and would then refuse the same seq again. `request` returns undefined once the report is no longer wanted.
  */
-async function send(transport: HerdrTransport, request: () => HerdrRequest): Promise<boolean> {
-	return (await transport(request(), 500)) || (await transport(request(), 1500));
+async function send(transport: HerdrTransport, request: () => HerdrRequest | undefined): Promise<boolean> {
+	for (const timeoutMs of [500, 1500]) {
+		const next = request();
+		if (!next) return false;
+		if (await transport(next, timeoutMs)) return true;
+	}
+	return false;
 }
 
 /**
@@ -112,7 +117,7 @@ export function createHerdrExtension(
 		// One report in flight at a time; only the newest waiting one is sent. When the newest one does not get through,
 		// `last` is cleared, so the next publish sends that state again instead of taking it as already reported.
 		let inFlight = false;
-		let queued: { report: typeof last; request: () => HerdrRequest } | undefined;
+		let queued: { report: typeof last; request: () => HerdrRequest | undefined } | undefined;
 		async function drain() {
 			if (inFlight) return;
 			inFlight = true;
@@ -152,7 +157,9 @@ export function createHerdrExtension(
 			};
 			queued = {
 				report: next,
-				request: () => ({ method: "pane.report_agent", params: { ...params, seq: nextSeq() } }),
+				// No try after session_shutdown: its seq would be above pane.release_agent's and take the pane back.
+				request: () =>
+					reporting ? { method: "pane.report_agent", params: { ...params, seq: nextSeq() } } : undefined,
 			};
 			void drain();
 		}
