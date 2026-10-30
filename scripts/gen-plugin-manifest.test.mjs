@@ -1515,8 +1515,10 @@ describe("import.meta in the copies", () => {
 		assert.equal(lines[2], "const p = { __dirname: 1, __filename() {} };");
 		assert.equal(lines[3], `const r = ${REQUIRE}.resolve("./data.txt");`);
 		assert.equal(lines[4], `const lit = require("./literal.cjs"), dyn = ${REQUIRE}(name);`);
-		assert.match(lines[5], /^const imported = \[import\("\.\/literal\.ts"\), import\(`\.\/template-\$\{x\}\.ts`\), \(\(s, o\) => import\(/);
-		assert.equal(lines[5].split(`Bun.resolveSync(s, ${SRC})`).length - 1, 2);
+		assert.match(lines[5], /^const imported = \[import\("\.\/literal\.ts"\), \(\(s, o\) => import\(/);
+		// (A template literal with a `${}` is an expression too: #193.)
+		assert.match(lines[5], /\)\(`\.\/template-\$\{x\}\.ts`\), /);
+		assert.equal(lines[5].split(`Bun.resolveSync(s, ${SRC})`).length - 1, 3);
 		assert.ok(lines[6].startsWith(`const url = ((s) => { const p = Bun.resolveSync(s, ${SRC});`), lines[6]);
 		assert.equal(lines.length, 7);
 	});
@@ -1604,6 +1606,77 @@ describe("import.meta in the copies", () => {
 			url: pathToFileURL(join(real, "data.txt")).href,
 			addon: "addon",
 		});
+	});
+
+	// Issue #193: the bundler bundles neither `import("./" + name)` nor `` import(`./${name}`) ``, nor any file they may name,
+	// and leaves them to resolve from /$bunfs. A webpack build loads its split chunks so: @cursor/sdk/sqlite's ESM build
+	// failed with "Cannot find module './19.js'" compiled in.
+	it("resolves an import() or require() of a specifier built from a string from the installed file, and leaves one of a whole string (#193)", () => {
+		const RESOLVE = `Bun.resolveSync(s, "\\u002finstalled\\u002fext\\u002fsrc")`;
+		const REQUIRE = 'process.getBuiltinModule("node:module").createRequire("\\u002finstalled\\u002fext\\u002fsrc\\u002findex.ts")';
+		for (const source of [
+			'var s = import("./" + _.u(t)).then(p);',
+			"const m = await import(`./chunks/${id}.js`);",
+			'const m = await import("./chunks/" + id + ".js", { with: { type: "json" } });',
+			"const m = await import(\n\t'./' + id\n);",
+		]) {
+			const rewritten = rewriteCopy(source, FILE);
+			assert.ok(rewritten.includes(RESOLVE), `${source}\n${rewritten}`);
+			assert.equal(rewritten.split("\n").length, source.split("\n").length, source);
+		}
+		assert.equal(rewriteCopy('const c = require("./" + id + ".js");', FILE), `const c = ${REQUIRE}("./" + id + ".js");`);
+		for (const source of [
+			'import("./a.js"); import( "./a.js" ); import("./a.js" /* a chunk */); import("./a.js", { with: { type: "json" } });',
+			"import(`./a.js`); import('./a.js');",
+			'const a = require("./a.cjs").a, b = require("./b.cjs")[0];',
+			'const c = "import(\\"./\\" + x)"; import();',
+		]) {
+			assert.equal(rewriteCopy(source, FILE), source);
+		}
+	});
+
+	it("loads a webpack build's split chunks from the installed package once the copy is gone (#193)", (context) => {
+		const bun = spawnSync("bun", ["--version"], { encoding: "utf8" });
+		if (bun.status !== 0) return context.skip("no bun on PATH");
+		const agentDir = agent({ packages: ["npm:uses-chunked"] });
+		installPackage(agentDir, "uses-chunked", { type: "module", pi: { extensions: ["./index.js"] }, dependencies: { chunked: "1" } }, []);
+		write(
+			join(agentDir, "npm", "node_modules", "uses-chunked", "index.js"),
+			'import { load, loadTemplate, loadRequired } from "chunked";\nexport default async () => ({ esm: await load(19), template: await loadTemplate(19), cjs: loadRequired(52) });\n',
+		);
+		const chunked = installPackage(agentDir, "chunked", { type: "module", main: "./dist/main.js" }, []);
+		// (As webpack's ESM output loads a chunk: `import("./" + __webpack_require__.u(chunkId))`.)
+		write(
+			join(chunked, "dist", "main.js"),
+			[
+				'import required from "./required.cjs";',
+				"const _ = { u: (id) => id + \".js\" };",
+				"export const load = async (id) => (await import(\"./\" + _.u(id))).value;",
+				"export const loadTemplate = async (id) => (await import(`./${_.u(id)}`)).value;",
+				"export const loadRequired = required;",
+				"",
+			].join("\n"),
+		);
+		write(join(chunked, "dist", "required.cjs"), 'module.exports = (id) => require("./" + id + ".cjs");\n');
+		write(join(chunked, "dist", "19.js"), 'export const value = "chunk 19";\n');
+		write(join(chunked, "dist", "52.cjs"), 'module.exports = "chunk 52";\n');
+
+		const out = join(scratch(), "build");
+		writePluginFolder(planPlugins({ agentDir }), join(out, "src"));
+		writeFileSync(
+			join(out, "main.ts"),
+			'const { default: plugins } = await import("./src/plugins.ts");\nconsole.log(JSON.stringify(await plugins[0].factory()));\n',
+		);
+		const built = spawnSync("bun", ["build", "--target=bun", "--format=esm", "--splitting", "./main.ts", "--outdir", "dist"], {
+			cwd: out,
+			encoding: "utf8",
+		});
+		assert.equal(built.status, 0, built.stderr);
+		// (As after `pi-bolt compile`: the copies are gone, and the build's folder has no chunk of the package.)
+		rmSync(join(out, "src"), { recursive: true, force: true });
+		const ran = spawnSync("bun", [join(out, "dist", "main.js")], { encoding: "utf8" });
+		assert.equal(ran.status, 0, ran.stderr);
+		assert.deepEqual(JSON.parse(ran.stdout), { esm: "chunk 19", template: "chunk 19", cjs: "chunk 52" });
 	});
 
 	it("pins the copies to the installed files, and leaves the installed files as they were", async () => {
@@ -1700,11 +1773,16 @@ describe("Pi's other names for its modules in the copies", () => {
 		const source = [
 			'const name = "@mariozechner/pi-tui"; // import "@mariozechner/pi-tui"',
 			'/* from "@sinclair/typebox" */ log(`import("@mariozechner/pi-ai")`);',
-			'loader.require("@mariozechner/pi-tui"); f("@mariozechner/pi-tui"); require("@mariozechner/pi-tui" + suffix);',
+			'loader.require("@mariozechner/pi-tui"); f("@mariozechner/pi-tui");',
 			'import { x } from "@mariozechner/pi-tui/dist/utils.js"; import { y } from "@mariozechner/clipboard";',
 			'import { z } from "@earendil-works/pi-ai/models"; import { w } from "constructor";',
 		].join("\n");
 		assert.equal(rewriteCopy(source, FILE), source);
+		// (Part of a specifier built as it runs: the require() is from the installed file (#193), the name as it is.)
+		assert.match(
+			rewriteCopy('require("@mariozechner/pi-tui" + suffix);', FILE),
+			/^process\.getBuiltinModule\("node:module"\)\.createRequire\([^)]*\)\("@mariozechner\/pi-tui" \+ suffix\);$/,
+		);
 	});
 
 	it("are replaced in the copies of extensions and of their dependencies, and not in the installed files", () => {
