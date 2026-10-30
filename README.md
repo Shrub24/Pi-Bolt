@@ -203,7 +203,8 @@ and `hosts` to `$PREFIX/glibc/etc`, where Termux's glibc reads them.
   its `prompt` tool and continue the session in later calls. [Setup](docs/MCP.md)
 - **Built-in search:** the `grep` and `find` tools are on by default and search in-process, following `.gitignore`, with
   nothing to install. With [`opensec-pi-fff`](https://www.npmjs.com/package/opensec-pi-fff) or `@ff-labs/pi-fff` loaded,
-  FFF's search tools are used instead.
+  FFF's search tools are used instead. To turn them off (for an extension with search tools of its own), set
+  `"defaultTools": ["-grep", "-find"]` in `~/.pi/agent/settings.json`.
 - **Compiled plugins:** `pi-bolt compile` compiles the extensions installed on this machine into your Pi-Bolt (Linux and macOS)
   with the release's own compiler, where they run as machine code; `pi-bolt update` compiles them into each new release.
   [Plugins](docs/PLUGINS.md)
