@@ -115,7 +115,7 @@ function withBodyIdleTimeout(response: Response, controller: AbortController, ti
 				timedOut = idleTimeoutError(timeoutMs);
 				controller.abort(timedOut);
 			}, timeoutMs);
-			let result: ReadableStreamReadResult<Uint8Array>;
+			let result: Awaited<ReturnType<typeof reader.read>>;
 			try {
 				result = await reader.read();
 			} catch (error) {
@@ -153,7 +153,10 @@ export function createBunIdleTimeoutFetch(
 	bunFetch: typeof globalThis.fetch,
 	timeoutMs: number,
 ): typeof globalThis.fetch {
-	const idleTimeoutFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+	const idleTimeoutFetch = async (
+		input: Parameters<typeof globalThis.fetch>[0],
+		init?: RequestInit,
+	): Promise<Response> => {
 		// A caller's own `timeout` option wins.
 		const bunInit: BunRequestInit = { timeout: false, ...init };
 		if (timeoutMs === 0) return bunFetch(input, bunInit);
