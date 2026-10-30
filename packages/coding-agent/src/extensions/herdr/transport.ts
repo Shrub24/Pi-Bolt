@@ -53,6 +53,25 @@ export function herdrFromEnvironment(
 
 let requestCount = 0;
 
+/** Longest unanswered input read before giving up; Herdr's answers are a few hundred bytes. */
+const MAX_ANSWER_LENGTH = 64 * 1024;
+
+/**
+ * What one line from Herdr's socket says about request `id`: true for `{"id", "result"}`, false for `{"id", "error"}` (or
+ * any other line with that id), undefined for a line that is not about this request.
+ */
+export function herdrAnswer(id: string, line: string): boolean | undefined {
+	let answer: unknown;
+	try {
+		answer = JSON.parse(line);
+	} catch {
+		return undefined;
+	}
+	if (typeof answer !== "object" || answer === null || (answer as { id?: unknown }).id !== id) return undefined;
+	const { result, error } = answer as { result?: unknown; error?: unknown };
+	return error == null && result !== undefined;
+}
+
 export function socketTransport(endpoint: string): HerdrTransport {
 	return (request, timeoutMs) =>
 		new Promise((resolve) => {
@@ -60,12 +79,12 @@ export function socketTransport(endpoint: string): HerdrTransport {
 			let socket: Socket | undefined;
 			const timeout = setTimeout(() => finish(false), timeoutMs);
 			timeout.unref?.();
-			function finish(answered: boolean) {
+			function finish(taken: boolean) {
 				if (done) return;
 				done = true;
 				clearTimeout(timeout);
 				socket?.destroy();
-				resolve(answered);
+				resolve(taken);
 			}
 			try {
 				// node:net loads on first report: only a Herdr pane needs it.
@@ -74,11 +93,26 @@ export function socketTransport(endpoint: string): HerdrTransport {
 				finish(false);
 				return;
 			}
-			const line = JSON.stringify({ id: `pi-bolt:${process.pid}:${++requestCount}`, ...request });
+			const id = `pi-bolt:${process.pid}:${++requestCount}`;
+			const line = JSON.stringify({ id, ...request });
+			// The answer is one line with this id: Herdr took the request only when it carries a result, not an error.
+			let buffered = "";
+			socket.setEncoding("utf8");
 			socket.on("error", () => finish(false));
 			socket.on("connect", () => socket?.write(`${line}\n`));
-			socket.on("data", () => finish(true));
-			socket.on("end", () => finish(false));
+			socket.on("data", (chunk: string) => {
+				buffered += chunk;
+				for (let newline = buffered.indexOf("\n"); newline >= 0; newline = buffered.indexOf("\n")) {
+					const answer = herdrAnswer(id, buffered.slice(0, newline));
+					buffered = buffered.slice(newline + 1);
+					if (answer !== undefined) {
+						finish(answer);
+						return;
+					}
+				}
+				if (buffered.length > MAX_ANSWER_LENGTH) finish(false);
+			});
+			socket.on("end", () => finish(herdrAnswer(id, buffered) ?? false));
 		});
 }
 

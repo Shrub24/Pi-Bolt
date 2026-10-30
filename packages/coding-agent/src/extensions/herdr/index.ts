@@ -33,9 +33,17 @@ export function quietOtherHerdrReporters(env: NodeJS.ProcessEnv = process.env): 
 	if (herdrFromEnvironment(env)) env.PI_HERDR_NO_SELF_REPORT ??= "1";
 }
 
-async function send(transport: HerdrTransport, request: HerdrRequest): Promise<void> {
-	if (await transport(request, 500)) return;
-	await transport(request, 1500);
+/**
+ * Two tries; true when Herdr took the report. Each try gets its own seq: Herdr may have applied a try whose answer was
+ * lost, and would then refuse the same seq again. `request` returns undefined once the report is no longer wanted.
+ */
+async function send(transport: HerdrTransport, request: () => HerdrRequest | undefined): Promise<boolean> {
+	for (const timeoutMs of [500, 1500]) {
+		const next = request();
+		if (!next) return false;
+		if (await transport(next, timeoutMs)) return true;
+	}
+	return false;
 }
 
 /**
@@ -80,6 +88,7 @@ export function createHerdrExtension(
 		let uiPrompt = false;
 		const blockedLabels: string[] = [];
 		const runningSubagents = new Set<string>();
+		let backgroundBusy = false;
 		let last: { state: AgentState; message?: string; sessionFile?: string } | undefined;
 
 		function updateSession(ctx: ExtensionContext) {
@@ -101,21 +110,22 @@ export function createHerdrExtension(
 			if (blockedLabels.length > 0) return { state: "blocked", message: blockedLabels[blockedLabels.length - 1] };
 			// A dialog during a run is a tool or extension waiting for the user; one opened at the prompt is the user's own.
 			if (uiPrompt && agentActive) return { state: "blocked" };
-			if (agentActive || runningSubagents.size > 0) return { state: "working" };
+			if (agentActive || backgroundBusy || runningSubagents.size > 0) return { state: "working" };
 			return { state: "idle" };
 		}
 
-		// One report in flight at a time; only the newest waiting one is sent.
+		// One report in flight at a time; only the newest waiting one is sent. When the newest one does not get through,
+		// `last` is cleared, so the next publish sends that state again instead of taking it as already reported.
 		let inFlight = false;
-		let queued: HerdrRequest | undefined;
+		let queued: { report: typeof last; request: () => HerdrRequest | undefined } | undefined;
 		async function drain() {
 			if (inFlight) return;
 			inFlight = true;
 			try {
 				while (queued) {
-					const request = queued;
+					const { report, request } = queued;
 					queued = undefined;
-					await send(transport, request);
+					if (!(await send(transport, request)) && !queued && last === report) last = undefined;
 				}
 			} finally {
 				inFlight = false;
@@ -136,22 +146,20 @@ export function createHerdrExtension(
 			}
 			last = next;
 			const argv = resumeArgv(sessionFile);
+			const params = {
+				pane_id: paneId,
+				source: SOURCE,
+				agent: AGENT,
+				state: next.state,
+				...(next.message ? { message: next.message } : {}),
+				...(sessionFile ? { agent_session_path: sessionFile } : sessionId ? { agent_session_id: sessionId } : {}),
+				...(argv ? { resume_argv: argv } : {}),
+			};
 			queued = {
-				method: "pane.report_agent",
-				params: {
-					pane_id: paneId,
-					source: SOURCE,
-					agent: AGENT,
-					state: next.state,
-					...(next.message ? { message: next.message } : {}),
-					seq: nextSeq(),
-					...(sessionFile
-						? { agent_session_path: sessionFile }
-						: sessionId
-							? { agent_session_id: sessionId }
-							: {}),
-					...(argv ? { resume_argv: argv } : {}),
-				},
+				report: next,
+				// No try after session_shutdown: its seq would be above pane.release_agent's and take the pane back.
+				request: () =>
+					reporting ? { method: "pane.report_agent", params: { ...params, seq: nextSeq() } } : undefined,
 			};
 			void drain();
 		}
@@ -211,6 +219,21 @@ export function createHerdrExtension(
 				publish();
 			});
 		}
+
+		// pi-subagents (nicobailon) says on this channel whether its background runs are going: { active: true, label }
+		// while any is, { active: false } once none is. It may describe the same runs as subagents:*; either keeps the pane
+		// working, and neither counts twice. It relabels by sending false and then true at once, so the report waits for
+		// the end of this tick rather than showing idle in between.
+		let busyPublishing = false;
+		pi.events.on("herdr:busy", (data) => {
+			backgroundBusy = Boolean((data as { active?: unknown } | undefined)?.active);
+			if (busyPublishing) return;
+			busyPublishing = true;
+			queueMicrotask(() => {
+				busyPublishing = false;
+				publish();
+			});
+		});
 
 		pi.on("session_shutdown", async (event) => {
 			if (!reporting) return;

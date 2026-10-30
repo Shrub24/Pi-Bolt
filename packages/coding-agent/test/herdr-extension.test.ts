@@ -7,7 +7,7 @@ import { COMMAND_NAME } from "../src/config.ts";
 import type { ExtensionAPI } from "../src/core/extensions/types.ts";
 import { createHerdrExtension, quietOtherHerdrReporters, resumeArgv } from "../src/extensions/herdr/index.ts";
 import { isHerdrPiIntegration } from "../src/extensions/herdr/integration-file.ts";
-import { herdrArguments } from "../src/extensions/herdr/transport.ts";
+import { type HerdrRequest, herdrAnswer, herdrArguments, socketTransport } from "../src/extensions/herdr/transport.ts";
 
 type Request = { id: string; method: string; params: Record<string, unknown> };
 
@@ -24,8 +24,10 @@ function tempDir(): string {
 	return dir;
 }
 
-/** A Herdr socket that answers every request and keeps what it got. */
-async function fakeHerdr(): Promise<{ socketPath: string; requests: Request[] }> {
+/** A Herdr socket that answers every request (by default, that it took it) and keeps what it got. */
+async function fakeHerdr(
+	answer: (request: Request) => Record<string, unknown> | Promise<Record<string, unknown>> = () => ({ result: {} }),
+): Promise<{ socketPath: string; requests: Request[] }> {
 	const socketPath = join(tempDir(), "herdr.sock");
 	const requests: Request[] = [];
 	const server = net.createServer((socket) => {
@@ -36,7 +38,9 @@ async function fakeHerdr(): Promise<{ socketPath: string; requests: Request[] }>
 				const request = JSON.parse(buffered.slice(0, newline)) as Request;
 				buffered = buffered.slice(newline + 1);
 				requests.push(request);
-				socket.write(`${JSON.stringify({ id: request.id, result: {} })}\n`);
+				void Promise.resolve(answer(request)).then((reply) =>
+					socket.write(`${JSON.stringify({ id: request.id, ...reply })}\n`),
+				);
 			}
 		});
 	});
@@ -86,8 +90,14 @@ async function until(check: () => boolean) {
 	expect(check()).toBe(true);
 }
 
-async function startedInHerdr(options: { mode?: string; sessionFile?: string } = {}) {
-	const herdr = await fakeHerdr();
+async function startedInHerdr(
+	options: {
+		mode?: string;
+		sessionFile?: string;
+		answer?: (request: Request) => Record<string, unknown> | Promise<Record<string, unknown>>;
+	} = {},
+) {
+	const herdr = await fakeHerdr(options.answer);
 	const env = { HERDR_ENV: "1", HERDR_SOCKET_PATH: herdr.socketPath, HERDR_PANE_ID: "w1:p2" };
 	const fake = fakePi();
 	let idle = true;
@@ -167,6 +177,52 @@ describe("Herdr extension", () => {
 		expect(run.states()).toEqual(["idle", "blocked", "idle", "working", "idle"]);
 	});
 
+	// #201: pi-subagents (nicobailon) reports its background runs with herdr:busy only.
+	test("herdr:busy keeps the pane working, under a block", async () => {
+		const run = await startedInHerdr();
+		await until(() => run.states().length === 1);
+		run.emit("herdr:busy", { active: true, label: "⏳ 1 subagent (worker)" });
+		await until(() => run.states().length === 2);
+		// A relabel is false then true at once: no idle report in between.
+		run.emit("herdr:busy", { active: false });
+		run.emit("herdr:busy", { active: true, label: "⏳ 2 subagents (worker, reviewer)" });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(run.states()).toEqual(["idle", "working"]);
+
+		run.emit("herdr:blocked", { active: true, label: "Question for you" });
+		await until(() => run.states().length === 3);
+		run.emit("herdr:blocked", { active: false });
+		await until(() => run.states().length === 4);
+		run.emit("herdr:busy", { active: false });
+		await until(() => run.states().length === 5);
+		expect(run.states()).toEqual(["idle", "working", "blocked", "working", "idle"]);
+	});
+
+	// #201: herdr:busy and subagents:* about the same runs count once; the pane is idle when both say done.
+	test("herdr:busy and subagents events together", async () => {
+		const run = await startedInHerdr();
+		await until(() => run.states().length === 1);
+		run.emit("subagents:started", { id: "a1" });
+		await until(() => run.states().length === 2);
+		run.emit("herdr:busy", { active: true, label: "⏳ 1 subagent" });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		run.emit("herdr:busy", { active: false });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(run.states()).toEqual(["idle", "working"]);
+		run.emit("subagents:completed", { id: "a1" });
+		await until(() => run.states().length === 3);
+
+		run.emit("herdr:busy", { active: true, label: "⏳ 1 subagent" });
+		await until(() => run.states().length === 4);
+		run.emit("subagents:started", { id: "a2" });
+		run.emit("subagents:completed", { id: "a2" });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(run.states()).toEqual(["idle", "working", "idle", "working"]);
+		run.emit("herdr:busy", { active: false });
+		await until(() => run.states().length === 5);
+		expect(run.states()).toEqual(["idle", "working", "idle", "working", "idle"]);
+	});
+
 	test("print, JSON and RPC runs and subagent sessions do not report", async () => {
 		const run = await startedInHerdr({ mode: "print" });
 		await run.fire("agent_start", { type: "agent_start" }, run.ctx);
@@ -201,6 +257,53 @@ describe("Herdr extension", () => {
 		expect(Date.now() - started).toBeLessThan(400);
 	});
 
+	// #200: a report Herdr refused counted as delivered, so it was neither tried a second time nor sent again.
+	test("a report Herdr refuses is tried twice, and sent again on the next publish", async () => {
+		let refuse = true;
+		const run = await startedInHerdr({
+			answer: () =>
+				refuse ? { error: { code: "resume_not_accepted", message: "report rejected" } } : { result: {} },
+		});
+		await until(() => run.states().length === 2);
+		// Each try has its own seq, and nothing is retried until something publishes again.
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(run.states()).toEqual(["idle", "idle"]);
+		const [first, second] = run.herdr.requests.map((r) => r.params.seq as number);
+		expect(second).toBeGreaterThan(first);
+
+		refuse = false;
+		// A dialog at the prompt leaves the state as it was; the state Herdr refused is sent again.
+		await run.fire("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "select" });
+		await until(() => run.states().length === 3);
+		// Once Herdr took it, the same state is not sent again.
+		await run.fire("ui_prompt_end", { type: "ui_prompt_end", reason: "ui_prompt", kind: "select" });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(run.states()).toEqual(["idle", "idle", "idle"]);
+	});
+
+	// #200 (PR #214 review): a report refused after the release on quit was tried again with a seq above the release's,
+	// which took the pane back.
+	test("nothing is reported after the release on quit", async () => {
+		let releaseArrived: (() => void) | undefined;
+		const refused = { error: { code: "resume_not_accepted", message: "report rejected" } };
+		const run = await startedInHerdr({
+			// The first report is refused only once the release is in.
+			answer: (request) => {
+				if (request.method === "pane.release_agent") {
+					setTimeout(() => releaseArrived?.(), 0);
+					return { result: {} };
+				}
+				return new Promise((resolve) => {
+					releaseArrived = () => resolve(refused);
+				});
+			},
+		});
+		await until(() => run.herdr.requests.length === 1);
+		await run.fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(run.herdr.requests.map((r) => r.method)).toEqual(["pane.report_agent", "pane.release_agent"]);
+	});
+
 	test("pi-herdr's own report of the pane is turned off in Herdr only", () => {
 		const inHerdr: NodeJS.ProcessEnv = { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/h.sock", HERDR_PANE_ID: "w1:p1" };
 		quietOtherHerdrReporters(inHerdr);
@@ -218,6 +321,70 @@ describe("Herdr extension", () => {
 		expect(resumeArgv("/home/me/a\nb.jsonl")).toBeUndefined();
 		expect(resumeArgv("/home/me/a\u0085b.jsonl")).toBeUndefined();
 		expect(resumeArgv(`/${"a".repeat(8200)}`)).toBeUndefined();
+	});
+});
+
+describe("Herdr socket", () => {
+	/** A socket that answers the first request line with `reply(id)`, as raw chunks, then closes. */
+	async function answering(reply: (id: string) => string[]): Promise<string> {
+		const socketPath = join(tempDir(), "herdr.sock");
+		const server = net.createServer((socket) => {
+			let buffered = "";
+			socket.on("data", async (chunk) => {
+				buffered += chunk.toString();
+				const newline = buffered.indexOf("\n");
+				if (newline < 0) return;
+				const { id } = JSON.parse(buffered.slice(0, newline)) as Request;
+				for (const part of reply(id)) {
+					socket.write(part);
+					await new Promise((resolve) => setTimeout(resolve, 5));
+				}
+				socket.end();
+			});
+		});
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+		cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+		return socketPath;
+	}
+
+	const report: HerdrRequest = {
+		method: "pane.report_agent",
+		params: { pane_id: "w1:p1", source: "pi-bolt", agent: "pi-bolt", state: "idle", seq: 1 },
+	};
+
+	// #200: an error answer counted as success.
+	test("an error answer is not success", async () => {
+		const endpoint = await answering((id) => [
+			`${JSON.stringify({ id, error: { code: "resume_not_accepted", message: "report rejected" } })}\n`,
+		]);
+		expect(await socketTransport(endpoint)(report, 500)).toBe(false);
+	});
+
+	// #200: any data counted as success, before the answer was complete or even about this request.
+	test("only the complete answer with this request's id counts", async () => {
+		const taken = await answering((id) => {
+			const answer = JSON.stringify({ id, result: {} });
+			return [
+				`${JSON.stringify({ id: "other", error: { code: "x" } })}\n`,
+				answer.slice(0, 5),
+				`${answer.slice(5)}\n`,
+			];
+		});
+		expect(await socketTransport(taken)(report, 500)).toBe(true);
+		const cut = await answering((id) => [JSON.stringify({ id, result: {} }).slice(0, 10)]);
+		expect(await socketTransport(cut)(report, 500)).toBe(false);
+		const unterminated = await answering((id) => [JSON.stringify({ id, result: {} })]);
+		expect(await socketTransport(unterminated)(report, 500)).toBe(true);
+	});
+
+	test("answer lines", () => {
+		expect(herdrAnswer("a", JSON.stringify({ id: "a", result: {} }))).toBe(true);
+		expect(herdrAnswer("a", JSON.stringify({ id: "a", result: null }))).toBe(true);
+		expect(herdrAnswer("a", JSON.stringify({ id: "a", error: { code: "x" } }))).toBe(false);
+		expect(herdrAnswer("a", JSON.stringify({ id: "a" }))).toBe(false);
+		expect(herdrAnswer("a", JSON.stringify({ id: "b", result: {} }))).toBeUndefined();
+		expect(herdrAnswer("a", "not json")).toBeUndefined();
+		expect(herdrAnswer("a", "null")).toBeUndefined();
 	});
 });
 
