@@ -33,9 +33,12 @@ export function quietOtherHerdrReporters(env: NodeJS.ProcessEnv = process.env): 
 	if (herdrFromEnvironment(env)) env.PI_HERDR_NO_SELF_REPORT ??= "1";
 }
 
-async function send(transport: HerdrTransport, request: HerdrRequest): Promise<void> {
-	if (await transport(request, 500)) return;
-	await transport(request, 1500);
+/**
+ * Two tries; true when Herdr took the report. Each try gets its own seq: Herdr may have applied a try whose answer was
+ * lost, and would then refuse the same seq again.
+ */
+async function send(transport: HerdrTransport, request: () => HerdrRequest): Promise<boolean> {
+	return (await transport(request(), 500)) || (await transport(request(), 1500));
 }
 
 /**
@@ -105,17 +108,18 @@ export function createHerdrExtension(
 			return { state: "idle" };
 		}
 
-		// One report in flight at a time; only the newest waiting one is sent.
+		// One report in flight at a time; only the newest waiting one is sent. When the newest one does not get through,
+		// `last` is cleared, so the next publish sends that state again instead of taking it as already reported.
 		let inFlight = false;
-		let queued: HerdrRequest | undefined;
+		let queued: { report: typeof last; request: () => HerdrRequest } | undefined;
 		async function drain() {
 			if (inFlight) return;
 			inFlight = true;
 			try {
 				while (queued) {
-					const request = queued;
+					const { report, request } = queued;
 					queued = undefined;
-					await send(transport, request);
+					if (!(await send(transport, request)) && !queued && last === report) last = undefined;
 				}
 			} finally {
 				inFlight = false;
@@ -136,22 +140,18 @@ export function createHerdrExtension(
 			}
 			last = next;
 			const argv = resumeArgv(sessionFile);
+			const params = {
+				pane_id: paneId,
+				source: SOURCE,
+				agent: AGENT,
+				state: next.state,
+				...(next.message ? { message: next.message } : {}),
+				...(sessionFile ? { agent_session_path: sessionFile } : sessionId ? { agent_session_id: sessionId } : {}),
+				...(argv ? { resume_argv: argv } : {}),
+			};
 			queued = {
-				method: "pane.report_agent",
-				params: {
-					pane_id: paneId,
-					source: SOURCE,
-					agent: AGENT,
-					state: next.state,
-					...(next.message ? { message: next.message } : {}),
-					seq: nextSeq(),
-					...(sessionFile
-						? { agent_session_path: sessionFile }
-						: sessionId
-							? { agent_session_id: sessionId }
-							: {}),
-					...(argv ? { resume_argv: argv } : {}),
-				},
+				report: next,
+				request: () => ({ method: "pane.report_agent", params: { ...params, seq: nextSeq() } }),
 			};
 			void drain();
 		}
