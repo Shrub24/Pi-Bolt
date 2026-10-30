@@ -171,6 +171,52 @@ describe("Herdr extension", () => {
 		expect(run.states()).toEqual(["idle", "blocked", "idle", "working", "idle"]);
 	});
 
+	// #201: pi-subagents (nicobailon) reports its background runs with herdr:busy only.
+	test("herdr:busy keeps the pane working, under a block", async () => {
+		const run = await startedInHerdr();
+		await until(() => run.states().length === 1);
+		run.emit("herdr:busy", { active: true, label: "⏳ 1 subagent (worker)" });
+		await until(() => run.states().length === 2);
+		// A relabel is false then true at once: no idle report in between.
+		run.emit("herdr:busy", { active: false });
+		run.emit("herdr:busy", { active: true, label: "⏳ 2 subagents (worker, reviewer)" });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(run.states()).toEqual(["idle", "working"]);
+
+		run.emit("herdr:blocked", { active: true, label: "Question for you" });
+		await until(() => run.states().length === 3);
+		run.emit("herdr:blocked", { active: false });
+		await until(() => run.states().length === 4);
+		run.emit("herdr:busy", { active: false });
+		await until(() => run.states().length === 5);
+		expect(run.states()).toEqual(["idle", "working", "blocked", "working", "idle"]);
+	});
+
+	// #201: herdr:busy and subagents:* about the same runs count once; the pane is idle when both say done.
+	test("herdr:busy and subagents events together", async () => {
+		const run = await startedInHerdr();
+		await until(() => run.states().length === 1);
+		run.emit("subagents:started", { id: "a1" });
+		await until(() => run.states().length === 2);
+		run.emit("herdr:busy", { active: true, label: "⏳ 1 subagent" });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		run.emit("herdr:busy", { active: false });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(run.states()).toEqual(["idle", "working"]);
+		run.emit("subagents:completed", { id: "a1" });
+		await until(() => run.states().length === 3);
+
+		run.emit("herdr:busy", { active: true, label: "⏳ 1 subagent" });
+		await until(() => run.states().length === 4);
+		run.emit("subagents:started", { id: "a2" });
+		run.emit("subagents:completed", { id: "a2" });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(run.states()).toEqual(["idle", "working", "idle", "working"]);
+		run.emit("herdr:busy", { active: false });
+		await until(() => run.states().length === 5);
+		expect(run.states()).toEqual(["idle", "working", "idle", "working", "idle"]);
+	});
+
 	test("print, JSON and RPC runs and subagent sessions do not report", async () => {
 		const run = await startedInHerdr({ mode: "print" });
 		await run.fire("agent_start", { type: "agent_start" }, run.ctx);

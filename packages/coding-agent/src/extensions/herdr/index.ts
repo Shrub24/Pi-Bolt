@@ -83,6 +83,7 @@ export function createHerdrExtension(
 		let uiPrompt = false;
 		const blockedLabels: string[] = [];
 		const runningSubagents = new Set<string>();
+		let backgroundBusy = false;
 		let last: { state: AgentState; message?: string; sessionFile?: string } | undefined;
 
 		function updateSession(ctx: ExtensionContext) {
@@ -104,7 +105,7 @@ export function createHerdrExtension(
 			if (blockedLabels.length > 0) return { state: "blocked", message: blockedLabels[blockedLabels.length - 1] };
 			// A dialog during a run is a tool or extension waiting for the user; one opened at the prompt is the user's own.
 			if (uiPrompt && agentActive) return { state: "blocked" };
-			if (agentActive || runningSubagents.size > 0) return { state: "working" };
+			if (agentActive || backgroundBusy || runningSubagents.size > 0) return { state: "working" };
 			return { state: "idle" };
 		}
 
@@ -211,6 +212,21 @@ export function createHerdrExtension(
 				publish();
 			});
 		}
+
+		// pi-subagents (nicobailon) says on this channel whether its background runs are going: { active: true, label }
+		// while any is, { active: false } once none is. It may describe the same runs as subagents:*; either keeps the pane
+		// working, and neither counts twice. It relabels by sending false and then true at once, so the report waits for
+		// the end of this tick rather than showing idle in between.
+		let busyPublishing = false;
+		pi.events.on("herdr:busy", (data) => {
+			backgroundBusy = Boolean((data as { active?: unknown } | undefined)?.active);
+			if (busyPublishing) return;
+			busyPublishing = true;
+			queueMicrotask(() => {
+				busyPublishing = false;
+				publish();
+			});
+		});
 
 		pi.on("session_shutdown", async (event) => {
 			if (!reporting) return;
