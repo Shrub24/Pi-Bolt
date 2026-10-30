@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
+import { RUNTIME_FETCH_WRAPPER } from "@earendil-works/pi-ai/utils/request-body";
 import type * as Undici from "undici";
 import { isBundledNode, isBunRuntime } from "../config.ts";
 
@@ -173,6 +174,9 @@ export function createBunIdleTimeoutFetch(
 		if (!response.body || NULL_BODY_STATUSES.has(response.status)) return response;
 		return withBodyIdleTimeout(response, controller, timeoutMs);
 	};
+	// The request body reaches `bunFetch` unchanged, so pi-ai still sends it as the bytes it keeps between requests
+	// when `bunFetch` is the runtime's own.
+	Object.defineProperty(idleTimeoutFetch, RUNTIME_FETCH_WRAPPER, { value: bunFetch });
 	// Keep Bun's fetch.preconnect (see connection-warmer.ts).
 	const preconnect = (bunFetch as { preconnect?: unknown }).preconnect;
 	if (typeof preconnect === "function") Object.assign(idleTimeoutFetch, { preconnect: preconnect.bind(bunFetch) });

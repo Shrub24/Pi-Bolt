@@ -1,5 +1,8 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
+import type { Model } from "@earendil-works/pi-ai";
+import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
+import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import * as undici from "undici";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type * as Config from "../src/config.ts";
@@ -10,14 +13,20 @@ vi.mock("../src/config.ts", async (importOriginal) => ({
 	isBunRuntime: true,
 }));
 
-// Stands in for Bun's fetch: http-dispatcher.ts takes the global fetch as Bun's own when it loads.
+// Stands in for Bun's fetch: http-dispatcher.ts takes the global fetch as Bun's own when it loads. A bound function
+// named "fetch" prints as native code, so pi-ai's request-body.ts takes it for the runtime's own too. It answers
+// requests to upstream.test (the model below) itself.
 const runtimeFetch = vi.hoisted(() => {
 	const nodeFetch = globalThis.fetch;
 	const inits: (RequestInit | undefined)[] = [];
-	const fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+	const record = async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
 		inits.push(init);
+		if (String(input instanceof Request ? input.url : input).startsWith("https://upstream.test/")) {
+			return new Response("{}", { status: 400 });
+		}
 		return nodeFetch(input, init);
 	};
+	const fetch = Object.defineProperty(record.bind(undefined), "name", { value: "fetch" });
 	globalThis.fetch = fetch as typeof globalThis.fetch;
 	return { nodeFetch, fetch, inits };
 });
@@ -57,6 +66,29 @@ describe("http dispatcher on Bun", () => {
 
 		configureHttpDispatcher();
 		expect(globalThis.fetch).toBe(runtimeFetch.fetch);
+	});
+
+	// The wrapper must not cost pi-ai the request body bytes it keeps between requests (#202).
+	it("still lets pi-ai send the request body as cached bytes through the wrapper", async () => {
+		configureHttpDispatcher(60_000);
+		expect(globalThis.fetch).not.toBe(runtimeFetch.fetch);
+		const model: Model<"openai-completions"> = {
+			id: "test-model",
+			name: "Test Model",
+			api: "openai-completions",
+			provider: "test-provider",
+			baseUrl: "https://upstream.test/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 1_000,
+		};
+		const context = normalizeContext({ messages: [{ role: "user", content: "hello", timestamp: 0 }] });
+		await streamSimple(model, context, { apiKey: "k", maxRetries: 0, sessionId: "s" }).result();
+		const body = runtimeFetch.inits.at(-1)?.body;
+		expect(body).toBeInstanceOf(Blob);
+		expect(JSON.parse(await (body as Blob).text())).toMatchObject({ model: "test-model", stream: true });
 	});
 
 	it("keeps a fetch another module installed", () => {

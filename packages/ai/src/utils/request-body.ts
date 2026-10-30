@@ -281,15 +281,29 @@ const wrappedClients = new WeakSet<object>();
 const runtimeFetches = new WeakMap<object, boolean>();
 
 /**
- * Whether `fetch` is the runtime's own (Bun's), not a function that wraps it: a wrapper passed to the SDK or installed
- * as the global fetch may read the body as the string the SDK sends otherwise, so it gets that string.
+ * The property through which a wrapper of a fetch names the fetch it wraps, when it hands the request body to it
+ * unchanged, as the HTTP idle timeout fetch Pi installs on Bun does (coding-agent's http-dispatcher.ts). A registered
+ * symbol, so it is the same key in every copy of this module.
+ */
+export const RUNTIME_FETCH_WRAPPER: unique symbol = Symbol.for("pi-ai.runtimeFetchWrapper");
+
+/**
+ * Whether `fetch` is the runtime's own (Bun's), or a wrapper whose RUNTIME_FETCH_WRAPPER is: any other wrapper passed
+ * to the SDK or installed as the global fetch may read the body as the string the SDK sends otherwise, so it gets that
+ * string.
  */
 function isRuntimeFetch(fetch: unknown): boolean {
 	if (typeof fetch !== "function") return false;
 	let native = runtimeFetches.get(fetch);
 	if (native === undefined) {
-		// A bound function prints as native code too, but its name starts with "bound ".
-		native = fetch.name === "fetch" && Function.prototype.toString.call(fetch).includes("[native code]");
+		const wrapped = (fetch as { [RUNTIME_FETCH_WRAPPER]?: unknown })[RUNTIME_FETCH_WRAPPER];
+		// Settled as not the runtime's first, so that wrappers that name each other end.
+		runtimeFetches.set(fetch, false);
+		native =
+			wrapped !== undefined
+				? isRuntimeFetch(wrapped)
+				: // A bound function prints as native code too, but its name starts with "bound ".
+					fetch.name === "fetch" && Function.prototype.toString.call(fetch).includes("[native code]");
 		runtimeFetches.set(fetch, native);
 	}
 	return native;
