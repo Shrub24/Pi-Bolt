@@ -203,7 +203,9 @@ export class StdioTransport extends TransportEvents implements McpTransport {
 			this.emitClose();
 			return;
 		}
-		if (child.exitCode !== null || child.signalCode !== null) {
+		// With process groups, a server that already exited can leave children holding its pipes; the
+		// group cleanup below still has to run for them.
+		if (!USE_PROCESS_GROUPS && (child.exitCode !== null || child.signalCode !== null)) {
 			child.stdin?.end();
 			return;
 		}
