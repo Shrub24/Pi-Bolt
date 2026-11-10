@@ -152,6 +152,7 @@ export function withRemoteCatalog(
 		...provider,
 		getModels: () => mergeChat(provider.getModels(), dynamicChatModels()),
 		getAllModels: () => mergeAll(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
+		refreshModelsAuth: "configured",
 		refreshModels: async (context) => {
 			const stored = context.stored;
 			const restored = remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id);

@@ -30,6 +30,7 @@ const ESTIMATE_SAFETY_RATIO = 0.2;
 const MIN_CLAMPED_MAX_TOKENS = CONTEXT_SAFETY_TOKENS;
 const MIN_MAX_TOKENS = 1;
 
+/** Fit maxTokens into the context window, leaving room for the input being counted higher than estimated. */
 export function clampMaxTokensToContext(model: Model<Api>, context: TranscriptContext, maxTokens: number): number {
 	if (model.contextWindow <= 0) return Math.max(MIN_MAX_TOKENS, maxTokens);
 	const estimate = estimateContextTokens(context);
@@ -70,6 +71,7 @@ export function buildBaseOptions(
 		cacheRetention: options?.cacheRetention,
 		sessionId: options?.sessionId,
 		immutableMessages: options?.immutableMessages,
+		disableContinuation: options?.disableContinuation,
 		headers: options?.headers,
 		identity: options?.identity,
 		onPayload: options?.onPayload,
