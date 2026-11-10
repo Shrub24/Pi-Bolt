@@ -109,6 +109,8 @@ describe("Anthropic strict tool schemas", () => {
 			properties: parameters.properties,
 			required: ["value"],
 		});
+	});
+
 	// https://github.com/earendil-works/pi/issues/9557
 	it("keeps root definitions in non-strict schemas so property refs resolve", async () => {
 		const settings = { type: "object", properties: { verbose: { type: "boolean" } } };

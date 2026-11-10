@@ -130,7 +130,7 @@ import { withBuiltInRenderers } from "../../core/tools/renderers/index.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
-import { addMcpServerConfig, loadMcpConfig } from "../../extensions/mcp/config.ts";
+import { addMcpServerConfig } from "../../extensions/mcp/config.ts";
 import { PIBOLT, PIBOLT_RELEASES_URL, piBoltUpdateCommand } from "../../pi-bolt.ts";
 import type { RemoteControlController } from "../../remote-control/controller.ts";
 import { loadRemoteControl } from "../../remote-control/remote-control.lazy.ts";
@@ -3351,6 +3351,26 @@ export class InteractiveMode {
 					component?.dispose?.();
 				} catch {
 					/* ignore dispose errors */
+				}
+			};
+
+			const removeOverlay = () => {
+				if (!overlayHandle || !this.extensionOverlays.delete(overlayHandle)) return;
+				overlayHandle.hide();
+				if (overlayStatusSource) this.programStatus.setBlocked(overlayStatusSource, undefined);
+				disposeComponent();
+			};
+
+			const close = (result: T) => {
+				if (closed) return;
+				closed = true;
+				if (isOverlay) {
+					removeOverlay();
+					resolve(result);
+				} else {
+					restoreEditor();
+					resolve(result);
+					disposeComponent();
 				}
 			};
 

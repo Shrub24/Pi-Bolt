@@ -34,7 +34,10 @@ export function githubCopilotProvider(): Provider<GitHubCopilotApi> {
 				oauth: lazyOAuth({ name: "GitHub Copilot", isSubscription: true, load: loadGitHubCopilotOAuth }),
 			},
 			get models() {
-				return [...Object.values(GITHUB_COPILOT_MODEL_CATALOG.chat()), ...Object.values(GITHUB_COPILOT_CLASSIFIER_MODELS)];
+				return [
+					...Object.values(GITHUB_COPILOT_MODEL_CATALOG.chat()),
+					...Object.values(GITHUB_COPILOT_CLASSIFIER_MODELS),
+				];
 			},
 			filterModels: (models, credential) => {
 				if (credential?.type !== "oauth") return models;
@@ -54,5 +57,4 @@ export function githubCopilotProvider(): Provider<GitHubCopilotApi> {
 		}),
 		GITHUB_COPILOT_MODEL_CATALOG,
 	);
-}
 }

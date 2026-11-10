@@ -18,7 +18,7 @@ import { canonicalizePath, pathsEqual, resolvePath } from "../../utils/paths.ts"
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
-import { type McpServerConfig, McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.ts";
+import { type McpServerConfig, McpServerRegistry, validateMcpServerConfig } from "../mcp-servers.ts";
 import {
 	MOBILE_VIEW_ICONS,
 	MOBILE_VIEW_ID_PATTERN,

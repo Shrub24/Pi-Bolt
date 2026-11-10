@@ -2,6 +2,7 @@
  * Shared diff computation utilities for the edit and similar tools.
  */
 
+import * as Diff from "diff";
 import { constants } from "fs";
 import { access, readFile } from "fs/promises";
 import { splitBom } from "../../utils/text.ts";
@@ -66,18 +67,6 @@ function getLineEndingAt(content: string, offset: number): "\r\n" | "\n" | "\r" 
 	return content[lineFeed - 1] === "\r" ? "\r\n" : "\n";
 }
 
-const ASCII_ONLY = /^[\x00-\x7f]*$/;
-// The ASCII characters trimEnd strips, other than "\n", at the end of a line.
-const ASCII_TRAILING_WHITESPACE = /[\t\v\f\r ](?:\n|$)/;
-
-/** Strip trailing whitespace from each line. */
-function trimLineEnds(text: string): string {
-	return text
-		.split("\n")
-		.map((line) => line.trimEnd())
-		.join("\n");
-}
-
 /**
  * Normalize text for fuzzy matching. Applies progressive transformations:
  * - Strip trailing whitespace from each line
@@ -86,13 +75,13 @@ function trimLineEnds(text: string): string {
  * - Normalize special Unicode spaces to regular space
  */
 export function normalizeForFuzzyMatch(text: string): string {
-	if (ASCII_ONLY.test(text)) {
-		// NFKC leaves ASCII unchanged and the replacements below only match non-ASCII characters, so
-		// only trailing whitespace can change. Scanning the large Unicode classes dominated this call.
-		return ASCII_TRAILING_WHITESPACE.test(text) ? trimLineEnds(text) : text;
-	}
 	return (
-		trimLineEnds(text.normalize("NFKC"))
+		text
+			.normalize("NFKC")
+			// Strip trailing whitespace per line
+			.split("\n")
+			.map((line) => line.trimEnd())
+			.join("\n")
 			// Smart single quotes → '
 			.replace(/[\u2018\u2019\u201A\u201B]/g, "'")
 			// Smart double quotes → "
@@ -106,21 +95,6 @@ export function normalizeForFuzzyMatch(text: string): string {
 			// U+205F medium math space, U+3000 ideographic space
 			.replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ")
 	);
-}
-
-let lastFuzzyInput: string | undefined;
-let lastFuzzyOutput = "";
-
-/**
- * normalizeForFuzzyMatch for whole file contents, remembering the last result. The edit preview and the
- * edit itself normalize the same file content one after the other.
- */
-function normalizeContentForFuzzyMatch(content: string): string {
-	if (content !== lastFuzzyInput) {
-		lastFuzzyOutput = normalizeForFuzzyMatch(content);
-		lastFuzzyInput = content;
-	}
-	return lastFuzzyOutput;
 }
 
 function splitLinesWithEndings(content: string): string[] {
@@ -274,11 +248,6 @@ export interface AppliedEditsResult {
  * Unicode quotes/dashes normalized to ASCII).
  */
 export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResult {
-	return findText(content, oldText, () => normalizeForFuzzyMatch(content));
-}
-
-/** fuzzyFindText with `normalizeForFuzzyMatch(content)` supplied by the caller, so it can be shared. */
-function findText(content: string, oldText: string, getFuzzyContent: () => string): FuzzyMatchResult {
 	// Try exact match first
 	const exactIndex = content.indexOf(oldText);
 	if (exactIndex !== -1) {
@@ -292,7 +261,7 @@ function findText(content: string, oldText: string, getFuzzyContent: () => strin
 	}
 
 	// Try fuzzy match - work entirely in normalized space
-	const fuzzyContent = getFuzzyContent();
+	const fuzzyContent = normalizeForFuzzyMatch(content);
 	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
 	const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
 
@@ -318,8 +287,8 @@ function findText(content: string, oldText: string, getFuzzyContent: () => strin
 	};
 }
 
-/** Occurrences of `oldText` in `fuzzyContent`, which is already fuzzy-normalized. */
-function countOccurrences(fuzzyContent: string, oldText: string): number {
+function countOccurrences(content: string, oldText: string): number {
+	const fuzzyContent = normalizeForFuzzyMatch(content);
 	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
 	return fuzzyContent.split(fuzzyOldText).length - 1;
 }
@@ -387,30 +356,19 @@ export function applyEditsToNormalizedContent(
 		}
 	}
 
-	// Normalized once for all edits: normalizing a large file per edit took most of a multi-edit call.
-	const fuzzyContent = normalizeContentForFuzzyMatch(normalizedContent);
-	const getFuzzyContent = (): string => fuzzyContent;
-	const initialMatches = normalizedEdits.map((edit) => findText(normalizedContent, edit.oldText, getFuzzyContent));
+	const initialMatches = normalizedEdits.map((edit) => fuzzyFindText(normalizedContent, edit.oldText));
 	const usedFuzzyMatch = initialMatches.some((match) => match.usedFuzzyMatch);
-	const replacementBaseContent = usedFuzzyMatch ? fuzzyContent : normalizedContent;
-	let fuzzyOfFuzzyContent: string | undefined;
-	const getReplacementBaseFuzzyContent = usedFuzzyMatch
-		? (): string => {
-				fuzzyOfFuzzyContent ??= normalizeForFuzzyMatch(fuzzyContent);
-				return fuzzyOfFuzzyContent;
-			}
-		: getFuzzyContent;
+	const replacementBaseContent = usedFuzzyMatch ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
 
 	const matchedEdits: MatchedEdit[] = [];
 	for (let i = 0; i < normalizedEdits.length; i++) {
 		const edit = normalizedEdits[i];
-		const matchResult = findText(replacementBaseContent, edit.oldText, getReplacementBaseFuzzyContent);
+		const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
 		if (!matchResult.found) {
 			throw getNotFoundError(path, i, normalizedEdits.length);
 		}
 
-		// normalizeForFuzzyMatch is idempotent, so this is the normalized replacement base either way.
-		const occurrences = countOccurrences(fuzzyContent, edit.oldText);
+		const occurrences = countOccurrences(replacementBaseContent, edit.oldText);
 		if (occurrences > 1) {
 			throw getDuplicateError(path, i, normalizedEdits.length, occurrences);
 		}
@@ -447,515 +405,12 @@ export function applyEditsToNormalizedContent(
 	return { baseContent, newContent, replacements };
 }
 
-/*
- * Line diffs over the changed window.
- *
- * Diff.diffLines tokenizes both texts in full, and the edit tool diffs the whole file up to three times per
- * edit (preview, display diff, patch). An edit changes a few lines of a large file, so most of that work walks
- * the unchanged prefix and suffix. `computeLineDiff` runs the same Myers search as jsdiff 8 (`Diff.diffWithOptionsObj`
- * with default options), step for step, so it returns the same parts, but:
- * - the common prefix is found by comparing text instead of lines; jsdiff's first step consumes exactly those lines,
- * - lines are split from the text on demand, so lines the search never reaches are never split,
- * - on the diagonal that ends at the end of both texts, reaching the common suffix ends the walk directly; jsdiff
- *   compares those lines one by one and finds them all equal.
- * The display diff and the patch are then built from the parts exactly as `generateDiffString` and
- * `Diff.structuredPatch` did, reading only the lines they output.
- *
- * Calling jsdiff on a cut-out window is not equivalent: lines after the change can make it align the change
- * differently. Lines "b c" against "c b" diff as "-b c +b", but with a common "b" appended jsdiff returns
- * "-b c b +b", not "-b c +b b". test/edit-diff-fast-path.test.ts
- * compares the output with jsdiff on randomized inputs; rerun it when upgrading the diff package.
- */
-
-/** A part of a line diff: like a jsdiff change object, without its value. */
-interface LineRun {
-	count: number;
-	added: boolean;
-	removed: boolean;
-}
-
-interface LineComponent extends LineRun {
-	previousComponent: LineComponent | undefined;
-}
-
-interface DiffPath {
-	oldPos: number;
-	lastComponent: LineComponent | undefined;
-}
-
-/**
- * The lines of a text as jsdiff tokenizes them (each with its trailing "\n"), split on demand. Splitting
- * starts at a known line start and goes forward or backward from there.
- */
-class LazyLines {
-	readonly text: string;
-	readonly count: number;
-	private readonly base: number;
-	private readonly forward: string[] = [];
-	private readonly backward: string[] = [];
-	private forwardEnd: number;
-	private backwardStart: number;
-
-	constructor(text: string, count: number, base: number, baseOffset: number) {
-		this.text = text;
-		this.count = count;
-		this.base = base;
-		this.forwardEnd = baseOffset;
-		this.backwardStart = baseOffset;
-	}
-
-	get(index: number): string {
-		if (index >= this.base) {
-			const forwardIndex = index - this.base;
-			while (this.forward.length <= forwardIndex) {
-				const newline = this.text.indexOf("\n", this.forwardEnd);
-				const end = newline === -1 ? this.text.length : newline + 1;
-				this.forward.push(this.text.slice(this.forwardEnd, end));
-				this.forwardEnd = end;
-			}
-			return this.forward[forwardIndex];
-		}
-		const backwardIndex = this.base - 1 - index;
-		while (this.backward.length <= backwardIndex) {
-			const end = this.backwardStart;
-			const start = end < 2 ? 0 : this.text.lastIndexOf("\n", end - 2) + 1;
-			this.backward.push(this.text.slice(start, end));
-			this.backwardStart = start;
-		}
-		return this.backward[backwardIndex];
-	}
-}
-
-/** Array.prototype.slice index resolution. */
-function resolveSliceIndex(value: number | undefined, length: number, fallback: number): number {
-	if (value === undefined) return fallback;
-	const index = Math.trunc(value) || 0;
-	return index < 0 ? Math.max(length + index, 0) : Math.min(index, length);
-}
-
-/** The lines of one diff part, read on demand. Stands in for the arrays split from a part's value. */
-class PartLines {
-	readonly length: number;
-	private readonly lines: LazyLines;
-	private readonly start: number;
-	private readonly keepNewlines: boolean;
-
-	constructor(lines: LazyLines, start: number, length: number, keepNewlines: boolean) {
-		this.lines = lines;
-		this.start = start;
-		this.length = length;
-		this.keepNewlines = keepNewlines;
-	}
-
-	/** Same result as `slice` on the array of the part's lines. */
-	slice(start?: number, end?: number): string[] {
-		const from = resolveSliceIndex(start, this.length, 0);
-		const to = resolveSliceIndex(end, this.length, this.length);
-		const result: string[] = [];
-		for (let i = from; i < to; i++) {
-			const line = this.lines.get(this.start + i);
-			result.push(this.keepNewlines || !line.endsWith("\n") ? line : line.slice(0, -1));
-		}
-		return result;
-	}
-}
-
-interface LineDiff {
-	oldText: string;
-	newText: string;
-	runs: LineRun[];
-	oldLines: LazyLines;
-	newLines: LazyLines;
-	/** `text.split("\n").length` of each side. */
-	oldSplitLength: number;
-	newSplitLength: number;
-}
-
-const COMMON_RUN_INITIAL_CHUNK = 256;
-const COMMON_RUN_LINEAR_SCAN = 32;
-
-function commonPrefixLength(a: string, b: string): number {
-	const max = Math.min(a.length, b.length);
-	let low = 0;
-	let step = COMMON_RUN_INITIAL_CHUNK;
-	while (low < max) {
-		let high = Math.min(low + step, max);
-		if (a.slice(low, high) !== b.slice(low, high)) {
-			// The first difference is in [low, high).
-			while (high - low > COMMON_RUN_LINEAR_SCAN) {
-				const mid = low + Math.floor((high - low) / 2);
-				if (a.slice(low, mid) === b.slice(low, mid)) low = mid;
-				else high = mid;
-			}
-			while (a.charCodeAt(low) === b.charCodeAt(low)) low++;
-			return low;
-		}
-		low = high;
-		step *= 2;
-	}
-	return max;
-}
-
-/** Length of the common suffix of `a` and `b`, at most `max`. */
-function commonSuffixLength(a: string, b: string, max: number): number {
-	let low = 0;
-	let step = COMMON_RUN_INITIAL_CHUNK;
-	while (low < max) {
-		let high = Math.min(low + step, max);
-		if (a.slice(a.length - high, a.length - low) !== b.slice(b.length - high, b.length - low)) {
-			// The last difference is in the suffix lengths (low, high].
-			while (high - low > COMMON_RUN_LINEAR_SCAN) {
-				const mid = low + Math.floor((high - low) / 2);
-				if (a.slice(a.length - mid, a.length - low) === b.slice(b.length - mid, b.length - low)) low = mid;
-				else high = mid;
-			}
-			while (a.charCodeAt(a.length - low - 1) === b.charCodeAt(b.length - low - 1)) low++;
-			return low;
-		}
-		low = high;
-		step *= 2;
-	}
-	return max;
-}
-
-function countNewlines(text: string, from: number, to: number): number {
-	let count = 0;
-	let index = text.indexOf("\n", from);
-	while (index !== -1 && index < to) {
-		count++;
-		index = text.indexOf("\n", index + 1);
-	}
-	return count;
-}
-
-/** Number of jsdiff line tokens in `text.slice(from, to)`, where `from` is a line start. */
-function countLines(text: string, from: number, to: number): number {
-	return countNewlines(text, from, to) + (to > from && text.charCodeAt(to - 1) !== 10 ? 1 : 0);
-}
-
-function addToPath(path: DiffPath, added: boolean, removed: boolean, oldPosInc: number): DiffPath {
-	const last = path.lastComponent;
-	if (last && last.added === added && last.removed === removed) {
-		return {
-			oldPos: path.oldPos + oldPosInc,
-			lastComponent: { count: last.count + 1, added, removed, previousComponent: last.previousComponent },
-		};
-	}
-	return {
-		oldPos: path.oldPos + oldPosInc,
-		lastComponent: { count: 1, added, removed, previousComponent: last },
-	};
-}
-
-function buildRuns(lastComponent: LineComponent | undefined): LineRun[] {
-	const runs: LineRun[] = [];
-	for (let component = lastComponent; component; component = component.previousComponent) {
-		runs.push({ count: component.count, added: component.added, removed: component.removed });
-	}
-	return runs.reverse();
-}
-
-/** jsdiff's Myers search (`Diff.diffWithOptionsObj`, default options) over lazily split lines. */
-function diffLineRuns(oldLines: LazyLines, newLines: LazyLines, prefixLines: number, suffixLines: number): LineRun[] {
-	const oldLen = oldLines.count;
-	const newLen = newLines.count;
-	const endDiagonal = oldLen - newLen;
-	const oldSuffixStart = oldLen - suffixLines;
-
-	const extractCommon = (basePath: DiffPath, diagonalPath: number): number => {
-		let oldPos = basePath.oldPos;
-		let newPos = oldPos - diagonalPath;
-		let commonCount = 0;
-		while (newPos + 1 < newLen && oldPos + 1 < oldLen) {
-			if (diagonalPath === endDiagonal && oldPos + 1 >= oldSuffixStart) {
-				// Both sides are in the common suffix at the same distance from the end: all remaining lines match.
-				const remaining = oldLen - 1 - oldPos;
-				oldPos += remaining;
-				newPos += remaining;
-				commonCount += remaining;
-				break;
-			}
-			if (oldLines.get(oldPos + 1) !== newLines.get(newPos + 1)) break;
-			newPos++;
-			oldPos++;
-			commonCount++;
-		}
-		if (commonCount) {
-			basePath.lastComponent = {
-				count: commonCount,
-				previousComponent: basePath.lastComponent,
-				added: false,
-				removed: false,
-			};
-		}
-		basePath.oldPos = oldPos;
-		return newPos;
-	};
-
-	// jsdiff's first step: the common prefix on diagonal 0.
-	const firstPath: DiffPath = {
-		oldPos: prefixLines - 1,
-		lastComponent:
-			prefixLines > 0
-				? { count: prefixLines, added: false, removed: false, previousComponent: undefined }
-				: undefined,
-	};
-	let newPos = prefixLines - 1;
-	if (firstPath.oldPos + 1 >= oldLen && newPos + 1 >= newLen) {
-		return buildRuns(firstPath.lastComponent);
-	}
-	const bestPath = new Map<number, DiffPath | undefined>([[0, firstPath]]);
-
-	let minDiagonalToConsider = -Infinity;
-	let maxDiagonalToConsider = Infinity;
-	const maxEditLength = newLen + oldLen;
-	for (let editLength = 1; editLength <= maxEditLength; editLength++) {
-		for (
-			let diagonalPath = Math.max(minDiagonalToConsider, -editLength);
-			diagonalPath <= Math.min(maxDiagonalToConsider, editLength);
-			diagonalPath += 2
-		) {
-			const removePath = bestPath.get(diagonalPath - 1);
-			const addPath = bestPath.get(diagonalPath + 1);
-			if (removePath) {
-				bestPath.set(diagonalPath - 1, undefined);
-			}
-			const canAdd =
-				addPath !== undefined && 0 <= addPath.oldPos - diagonalPath && addPath.oldPos - diagonalPath < newLen;
-			const canRemove = removePath !== undefined && removePath.oldPos + 1 < oldLen;
-			let basePath: DiffPath;
-			if (canAdd && (!canRemove || removePath.oldPos < addPath.oldPos)) {
-				basePath = addToPath(addPath, true, false, 0);
-			} else if (canRemove) {
-				basePath = addToPath(removePath, false, true, 1);
-			} else {
-				bestPath.set(diagonalPath, undefined);
-				continue;
-			}
-			newPos = extractCommon(basePath, diagonalPath);
-			if (basePath.oldPos + 1 >= oldLen && newPos + 1 >= newLen) {
-				return buildRuns(basePath.lastComponent);
-			}
-			bestPath.set(diagonalPath, basePath);
-			if (basePath.oldPos + 1 >= oldLen) {
-				maxDiagonalToConsider = Math.min(maxDiagonalToConsider, diagonalPath - 1);
-			}
-			if (newPos + 1 >= newLen) {
-				minDiagonalToConsider = Math.max(minDiagonalToConsider, diagonalPath + 1);
-			}
-		}
-	}
-	// Unreachable: an edit script of length oldLen + newLen always exists.
-	throw new Error("Line diff did not terminate.");
-}
-
-function computeLineDiff(oldText: string, newText: string): LineDiff {
-	if (oldText === newText) {
-		const count = countLines(oldText, 0, oldText.length);
-		const lines = new LazyLines(oldText, count, 0, 0);
-		const splitLength = countNewlines(oldText, 0, oldText.length) + 1;
-		return {
-			oldText,
-			newText,
-			runs: count > 0 ? [{ count, added: false, removed: false }] : [],
-			oldLines: lines,
-			newLines: lines,
-			oldSplitLength: splitLength,
-			newSplitLength: splitLength,
-		};
-	}
-
-	// Common prefix lines end at the last "\n" of the common prefix. The texts differ, so a final line
-	// without "\n" cannot be common to both.
-	const prefixChars = commonPrefixLength(oldText, newText);
-	const prefixEnd = prefixChars === 0 ? 0 : oldText.lastIndexOf("\n", prefixChars - 1) + 1;
-
-	// Common suffix lines start at a line start in both texts, after the prefix lines.
-	const suffixChars = commonSuffixLength(oldText, newText, Math.min(oldText.length, newText.length) - prefixEnd);
-	const oldTail = oldText.length - suffixChars;
-	const newTail = newText.length - suffixChars;
-	let suffixLength: number;
-	if (
-		(oldTail === 0 || oldText.charCodeAt(oldTail - 1) === 10) &&
-		(newTail === 0 || newText.charCodeAt(newTail - 1) === 10)
-	) {
-		suffixLength = suffixChars;
-	} else {
-		const newline = oldText.indexOf("\n", oldTail);
-		suffixLength = newline === -1 ? 0 : oldText.length - newline - 1;
-	}
-	const oldSuffixStart = oldText.length - suffixLength;
-	const newSuffixStart = newText.length - suffixLength;
-
-	const prefixLines = countNewlines(oldText, 0, prefixEnd);
-	const suffixNewlines = countNewlines(oldText, oldSuffixStart, oldText.length);
-	const suffixLines = countLines(oldText, oldSuffixStart, oldText.length);
-	const oldMiddleNewlines = countNewlines(oldText, prefixEnd, oldSuffixStart);
-	const newMiddleNewlines = countNewlines(newText, prefixEnd, newSuffixStart);
-
-	const oldLines = new LazyLines(
-		oldText,
-		prefixLines + countLines(oldText, prefixEnd, oldSuffixStart) + suffixLines,
-		prefixLines,
-		prefixEnd,
-	);
-	const newLines = new LazyLines(
-		newText,
-		prefixLines + countLines(newText, prefixEnd, newSuffixStart) + suffixLines,
-		prefixLines,
-		prefixEnd,
-	);
-	return {
-		oldText,
-		newText,
-		runs: diffLineRuns(oldLines, newLines, prefixLines, suffixLines),
-		oldLines,
-		newLines,
-		oldSplitLength: prefixLines + oldMiddleNewlines + suffixNewlines + 1,
-		newSplitLength: prefixLines + newMiddleNewlines + suffixNewlines + 1,
-	};
-}
-
-let lastLineDiff: LineDiff | undefined;
-
-/** computeLineDiff, remembering the last result: the edit tool builds a display diff and a patch of the same texts. */
-function getLineDiff(oldText: string, newText: string): LineDiff {
-	if (lastLineDiff?.oldText !== oldText || lastLineDiff.newText !== newText) {
-		lastLineDiff = computeLineDiff(oldText, newText);
-	}
-	return lastLineDiff;
-}
-
-/** The lines of each part of `lineDiff`, as jsdiff would put them in the part's value. */
-function getPartLines(lineDiff: LineDiff, keepNewlines: boolean): PartLines[] {
-	let oldIndex = 0;
-	let newIndex = 0;
-	return lineDiff.runs.map((run) => {
-		if (run.removed) {
-			const lines = new PartLines(lineDiff.oldLines, oldIndex, run.count, keepNewlines);
-			oldIndex += run.count;
-			return lines;
-		}
-		const lines = new PartLines(lineDiff.newLines, newIndex, run.count, keepNewlines);
-		newIndex += run.count;
-		if (!run.added) oldIndex += run.count;
-		return lines;
-	});
-}
-
-interface PatchHunk {
-	oldStart: number;
-	oldLines: number;
-	newStart: number;
-	newLines: number;
-	lines: string[];
-}
-
-/**
- * Generate a standard unified patch. Same output as
- * `Diff.createTwoFilesPatch(path, path, oldContent, newContent, undefined, undefined, { context: contextLines, headerOptions: Diff.FILE_HEADERS_ONLY })`.
- */
+/** Generate a standard unified patch. */
 export function generateUnifiedPatch(path: string, oldContent: string, newContent: string, contextLines = 4): string {
-	const lineDiff = getLineDiff(oldContent, newContent);
-	const runs = lineDiff.runs;
-	const partLines = getPartLines(lineDiff, true);
-	const context = contextLines;
-
-	// Diff.structuredPatch, step 1. jsdiff appends an empty part to make cleanup easier; index runs.length is it.
-	const partCount = runs.length + 1;
-	const emptyLines = new PartLines(lineDiff.newLines, 0, 0, true);
-	const contextLinesOf = (lines: string[]): string[] => lines.map((entry) => ` ${entry}`);
-	const hunks: PatchHunk[] = [];
-	let oldRangeStart = 0;
-	let newRangeStart = 0;
-	let curRange: string[] = [];
-	let oldLine = 1;
-	let newLine = 1;
-	for (let i = 0; i < partCount; i++) {
-		const current: LineRun = i < runs.length ? runs[i] : { count: 0, added: false, removed: false };
-		const lines = i < runs.length ? partLines[i] : emptyLines;
-		if (current.added || current.removed) {
-			// If we have previous context, start with that
-			if (!oldRangeStart) {
-				oldRangeStart = oldLine;
-				newRangeStart = newLine;
-				if (i > 0) {
-					curRange = context > 0 ? contextLinesOf(partLines[i - 1].slice(-context)) : [];
-					oldRangeStart -= curRange.length;
-					newRangeStart -= curRange.length;
-				}
-			}
-			// Output our changes
-			for (const line of lines.slice()) {
-				curRange.push((current.added ? "+" : "-") + line);
-			}
-			// Track the updated file position
-			if (current.added) {
-				newLine += lines.length;
-			} else {
-				oldLine += lines.length;
-			}
-		} else {
-			// Identical context lines. Track line changes
-			if (oldRangeStart) {
-				// Close out any changes that have been output (or join overlapping)
-				if (lines.length <= context * 2 && i < partCount - 2) {
-					// Overlapping
-					for (const line of contextLinesOf(lines.slice())) {
-						curRange.push(line);
-					}
-				} else {
-					// end the range and output
-					const contextSize = Math.min(lines.length, context);
-					for (const line of contextLinesOf(lines.slice(0, contextSize))) {
-						curRange.push(line);
-					}
-					hunks.push({
-						oldStart: oldRangeStart,
-						oldLines: oldLine - oldRangeStart + contextSize,
-						newStart: newRangeStart,
-						newLines: newLine - newRangeStart + contextSize,
-						lines: curRange,
-					});
-					oldRangeStart = 0;
-					newRangeStart = 0;
-					curRange = [];
-				}
-			}
-			oldLine += lines.length;
-			newLine += lines.length;
-		}
-	}
-
-	// Step 2: eliminate the trailing "\n" from each line of each hunk, and, where needed, add
-	// "\ No newline at end of file".
-	for (const hunk of hunks) {
-		for (let i = 0; i < hunk.lines.length; i++) {
-			if (hunk.lines[i].endsWith("\n")) {
-				hunk.lines[i] = hunk.lines[i].slice(0, -1);
-			} else {
-				hunk.lines.splice(i + 1, 0, "\\ No newline at end of file");
-				i++; // Skip the line we just added, then continue iterating
-			}
-		}
-	}
-
-	// Diff.formatPatch with Diff.FILE_HEADERS_ONLY.
-	const ret = [`--- ${path}`, `+++ ${path}`];
-	for (const hunk of hunks) {
-		// Unified Diff Format quirk: If the chunk size is 0, the first number is one lower than one would expect.
-		if (hunk.oldLines === 0) {
-			hunk.oldStart -= 1;
-		}
-		if (hunk.newLines === 0) {
-			hunk.newStart -= 1;
-		}
-		ret.push(`@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`);
-		for (const line of hunk.lines) {
-			ret.push(line);
-		}
-	}
-	return `${ret.join("\n")}\n`;
+	return Diff.createTwoFilesPatch(path, path, oldContent, newContent, undefined, undefined, {
+		context: contextLines,
+		headerOptions: Diff.FILE_HEADERS_ONLY,
+	});
 }
 
 /**
@@ -967,22 +422,51 @@ export function generateDiffString(
 	newContent: string,
 	contextLines = 4,
 ): { diff: string; firstChangedLine: number | undefined } {
-	const lineDiff = getLineDiff(oldContent, newContent);
-	const parts = lineDiff.runs;
-	const partLines = getPartLines(lineDiff, false);
+	const lineNumWidth = String(Math.max(countLines(oldContent), countLines(newContent))).length;
+	const { output, firstChangedLine } = formatDisplayDiff(
+		Diff.diffLines(oldContent, newContent),
+		1,
+		1,
+		lineNumWidth,
+		contextLines,
+	);
+	return { diff: output.join("\n"), firstChangedLine };
+}
+
+/** Number of lines as `text.split("\n").length` counts them, without building the array. */
+function countLines(text: string): number {
+	return countLineFeeds(text, 0, text.length) + 1;
+}
+
+function countLineFeeds(text: string, start: number, end: number): number {
+	let count = 0;
+	for (let index = text.indexOf("\n", start); index !== -1 && index < end; index = text.indexOf("\n", index + 1)) {
+		count++;
+	}
+	return count;
+}
+
+/** Format jsdiff line parts as display diff lines, numbering from the given 1-based old and new lines. */
+function formatDisplayDiff(
+	parts: Diff.ChangeObject<string>[],
+	oldStartLine: number,
+	newStartLine: number,
+	lineNumWidth: number,
+	contextLines: number,
+): { output: string[]; firstChangedLine: number | undefined } {
 	const output: string[] = [];
 
-	const maxLineNum = Math.max(lineDiff.oldSplitLength, lineDiff.newSplitLength);
-	const lineNumWidth = String(maxLineNum).length;
-
-	let oldLineNum = 1;
-	let newLineNum = 1;
+	let oldLineNum = oldStartLine;
+	let newLineNum = newStartLine;
 	let lastWasChange = false;
 	let firstChangedLine: number | undefined;
 
 	for (let i = 0; i < parts.length; i++) {
 		const part = parts[i];
-		const raw = partLines[i];
+		const raw = part.value.split("\n");
+		if (raw[raw.length - 1] === "") {
+			raw.pop();
+		}
 
 		if (part.added || part.removed) {
 			// Capture the first changed line (in the new file)
@@ -991,7 +475,7 @@ export function generateDiffString(
 			}
 
 			// Show the change
-			for (const line of raw.slice()) {
+			for (const line of raw) {
 				if (part.added) {
 					const lineNum = String(newLineNum).padStart(lineNumWidth, " ");
 					output.push(`+${lineNum} ${line}`);
@@ -1012,7 +496,7 @@ export function generateDiffString(
 
 			if (hasLeadingChange && hasTrailingChange) {
 				if (raw.length <= contextLines * 2) {
-					for (const line of raw.slice()) {
+					for (const line of raw) {
 						const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
 						output.push(` ${lineNum} ${line}`);
 						oldLineNum++;

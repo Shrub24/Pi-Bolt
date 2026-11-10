@@ -1283,7 +1283,7 @@ export class AgentSession {
 	 * Internal handler for agent events - shared by subscribe and reconnect. Runs synchronously and returns undefined
 	 * when no extension handles the event (most streamed deltas); otherwise returns a promise of the whole dispatch.
 	 */
-	private _handleAgentEvent = (event: AgentEvent): Promise<void> | undefined => {
+	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
 		// An abort requested while the run was starting, e.g. during before_agent_start, stops it
 		// here. agent_start is awaited before the first request.
 		if (event.type === "agent_start" && this._agentRunAbortRequested) this.agent.abort();

@@ -745,7 +745,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
 			};
-			const compat = getAnthropicCompat(model);
 			cache = beginRequestCache("anthropic-messages", options, [
 				model.id,
 				model.provider,
@@ -791,7 +790,13 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						? prepareThreadRequest(model, threadSessionId, params)
 						: undefined;
 				// A client passed in by the caller is not wrapped.
-				cacheRequestBody(options?.client ? undefined : client, params.messages, "messages", options?.sessionId, cache);
+				cacheRequestBody(
+					options?.client ? undefined : client,
+					params.messages,
+					"messages",
+					options?.sessionId,
+					cache,
+				);
 				try {
 					const sent = prepared
 						? await sendThreadRequest(prepared, params, send, output, options?.signal)
@@ -821,7 +826,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						details: { reason: "strict_tool_limits_exceeded" },
 					});
 				}
-			}
 			}
 			cache?.end();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -1313,6 +1317,7 @@ function buildParams(
 	cache?: RequestCacheRun,
 ): {
 	params: MessageCreateParamsStreaming;
+	hasPreferredStrictTools: boolean;
 	/** Effort of the final effort marker, recorded on the reply so later requests can replay it. */
 	providerThinkingLevel: AnthropicEffort | undefined;
 } {
@@ -1328,15 +1333,24 @@ function buildParams(
 	// by value in a `tool_addition` block, which also expresses same-name redefinitions.
 	// Anthropic rejects a tool list where every tool is deferred, so there must be an initial
 	// active tool to anchor the placeholder. Otherwise the current tool list is sent.
-	const convertToolDefinitions = (tools: Tool[], toolCacheControl?: CacheControlEphemeral): BetaTool[] =>
-		convertTools(
+	let hasPreferredStrictTools = false;
+	const convertToolDefinitions = (tools: Tool[], toolCacheControl?: CacheControlEphemeral): BetaTool[] => {
+		const definitions = convertTools(
 			tools,
 			isOAuthToken,
 			compat.supportsEagerToolInputStreaming,
 			compat.supportsStrictTools,
 			toolCacheControl,
-			flags.disablePreferredStrictTools,
 		);
+		if (
+			definitions.some(
+				(definition, index) => definition.strict === true && prefersJsonSchemaStrictSampling(tools[index]),
+			)
+		) {
+			hasPreferredStrictTools = true;
+		}
+		return definitions;
+	};
 	const initialTools = initialSystemMessage?.toolsAdded ?? [];
 	const nativeToolChanges =
 		compat.supportsMidConvoSystemMessages && compat.supportsMidConvoToolChanges && initialTools.length > 0;
@@ -1475,7 +1489,7 @@ function buildParams(
 		params.fallbacks = allowedFallbackModels.map((fallback) => ({ model: fallback.model }));
 	}
 
-	return { params, providerThinkingLevel: effortMessages ? activeEffort : undefined };
+	return { params, hasPreferredStrictTools, providerThinkingLevel: effortMessages ? activeEffort : undefined };
 }
 
 // Normalize tool call IDs to match Anthropic's required pattern and length

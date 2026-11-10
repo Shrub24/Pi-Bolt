@@ -43,9 +43,11 @@ const compat = {
 	sendSessionAffinityHeaders: false,
 	sessionAffinityFormat: "openai",
 	supportsLongCacheRetention: true,
+	requiresNonNullAssistantContent: false,
+	requiresToolsWithToolHistory: false,
 } satisfies Omit<
 	Required<OpenAICompletionsCompat>,
-	"cacheControlFormat" | "thinkingTokenBudgetField" | "vllmPriority"
+	"cacheControlFormat" | "thinkingTokenBudgetField" | "vllmPriority" | "promptCacheKeyMode"
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 	thinkingTokenBudgetField?: OpenAICompletionsCompat["thinkingTokenBudgetField"];

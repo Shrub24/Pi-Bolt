@@ -52,38 +52,15 @@ export interface TruncationOptions {
 	maxBytes?: number;
 }
 
-/**
- * Number of lines in `content`: one per "\n"-separated line, not counting the empty one after a trailing "\n".
- * Counted without splitting: callers truncate output that can be many megabytes to a few kilobytes, and splitting
- * would allocate a string per line of all of it.
- */
-function countLines(content: string): number {
+function splitLinesForCounting(content: string): string[] {
 	if (content.length === 0) {
-		return 0;
+		return [];
 	}
-	let lines = 1;
-	for (let i = content.indexOf("\n"); i !== -1; i = content.indexOf("\n", i + 1)) {
-		lines++;
+	const lines = content.split("\n");
+	if (content.endsWith("\n")) {
+		lines.pop();
 	}
-	return content.endsWith("\n") ? lines - 1 : lines;
-}
-
-const NON_ASCII = /[\u0080-\uffff]/g;
-const SURROGATE = /[\ud800-\udfff]/;
-const SURROGATE_PAIRS = /[\ud800-\udbff][\udc00-\udfff]/g;
-
-/** Index of the first non-ASCII character of `content` at or after `from`, or its length if there is none. */
-function findNonAscii(content: string, from: number): number {
-	NON_ASCII.lastIndex = from;
-	return NON_ASCII.exec(content)?.index ?? content.length;
-}
-
-/**
- * A copy of `text` that shares no memory with the string it was cut from, so a short result does not keep a large
- * input alive. UTF-16 code units round-trip unchanged, lone surrogates included.
- */
-function copyString(text: string): string {
-	return Buffer.from(text, "utf16le").toString("utf16le");
+	return lines;
 }
 
 /**
@@ -111,7 +88,8 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 
 	const totalBytes = Buffer.byteLength(content, "utf-8");
-	const totalLines = countLines(content);
+	const lines = splitLinesForCounting(content);
+	const totalLines = lines.length;
 
 	// Check if no truncation needed
 	if (totalLines <= maxLines && totalBytes <= maxBytes) {
@@ -131,12 +109,7 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 	}
 
 	// Check if first line alone exceeds byte limit
-	// Every non-ASCII character takes more UTF-8 bytes than UTF-16 units, so equal lengths mean the content is ASCII and
-	// a line's byte length is its length.
-	const ascii = totalBytes === content.length;
-	const firstNewline = content.indexOf("\n");
-	const firstLineEnd = firstNewline === -1 ? content.length : firstNewline;
-	const firstLineBytes = ascii ? firstLineEnd : Buffer.byteLength(content.slice(0, firstLineEnd), "utf-8");
+	const firstLineBytes = Buffer.byteLength(lines[0], "utf-8");
 	if (firstLineBytes > maxBytes) {
 		return {
 			content: "",
@@ -153,51 +126,40 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 		};
 	}
 
-	// Count the complete lines that fit. They are a prefix of `content`, which is cut once instead of slicing every
-	// line and joining them again. Only lines that contain a non-ASCII character are measured with Buffer.byteLength.
-	let outputLines = 0;
+	// Collect complete lines that fit
+	const outputLinesArr: string[] = [];
 	let outputBytesCount = 0;
-	let outputEnd = 0;
 	let truncatedBy: "lines" | "bytes" = "lines";
-	let nextNonAscii = ascii ? content.length : findNonAscii(content, 0);
 
-	for (let start = 0; outputLines < totalLines && outputLines < maxLines; ) {
-		const newline = content.indexOf("\n", start);
-		const end = newline === -1 ? content.length : newline;
-		let lineBytes: number;
-		if (end <= nextNonAscii) {
-			lineBytes = end - start;
-		} else {
-			lineBytes = Buffer.byteLength(content.slice(start, end), "utf-8");
-			nextNonAscii = findNonAscii(content, end);
-		}
-		if (outputLines > 0) lineBytes++; // +1 for newline
+	for (let i = 0; i < lines.length && i < maxLines; i++) {
+		const line = lines[i];
+		const lineBytes = Buffer.byteLength(line, "utf-8") + (i > 0 ? 1 : 0); // +1 for newline
 
 		if (outputBytesCount + lineBytes > maxBytes) {
 			truncatedBy = "bytes";
 			break;
 		}
 
-		outputLines++;
+		outputLinesArr.push(line);
 		outputBytesCount += lineBytes;
-		outputEnd = end;
-		start = end + 1;
 	}
 
 	// If we exited due to line limit
-	if (outputLines >= maxLines && outputBytesCount <= maxBytes) {
+	if (outputLinesArr.length >= maxLines && outputBytesCount <= maxBytes) {
 		truncatedBy = "lines";
 	}
 
+	const outputContent = outputLinesArr.join("\n");
+	const finalOutputBytes = Buffer.byteLength(outputContent, "utf-8");
+
 	return {
-		content: copyString(content.slice(0, outputEnd)),
+		content: outputContent,
 		truncated: true,
 		truncatedBy,
 		totalLines,
 		totalBytes,
-		outputLines,
-		// A "\n" never splits a surrogate pair, so the lines' byte lengths add up to the output's.
-		outputBytes: outputBytesCount,
+		outputLines: outputLinesArr.length,
+		outputBytes: finalOutputBytes,
 		lastLinePartial: false,
 		firstLineExceedsLimit: false,
 		maxLines,
@@ -216,7 +178,8 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 
 	const totalBytes = Buffer.byteLength(content, "utf-8");
-	const totalLines = countLines(content);
+	const lines = splitLinesForCounting(content);
+	const totalLines = lines.length;
 
 	// Check if no truncation needed
 	if (totalLines <= maxLines && totalBytes <= maxBytes) {
@@ -235,55 +198,50 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 		};
 	}
 
-	// Work backwards from the end. A trailing "\n" ends the last line. The kept lines are a suffix of the content up to
-	// that "\n", which is cut once instead of slicing every line and joining them again.
-	const ascii = totalBytes === content.length;
-	const contentEnd = content.endsWith("\n") ? content.length - 1 : content.length;
-	let outputLines = 0;
+	// Work backwards from the end
+	const outputLinesArr: string[] = [];
 	let outputBytesCount = 0;
-	let outputStart = contentEnd;
-	let partialLine: string | undefined;
 	let truncatedBy: "lines" | "bytes" = "lines";
+	let lastLinePartial = false;
 
-	let end = contentEnd;
-	for (let i = totalLines - 1; i >= 0 && outputLines < maxLines; i--) {
-		const start = i === 0 ? 0 : content.lastIndexOf("\n", end - 1) + 1;
-		const lineBytes =
-			(ascii ? end - start : Buffer.byteLength(content.slice(start, end), "utf-8")) + (outputLines > 0 ? 1 : 0); // +1 for newline
+	for (let i = lines.length - 1; i >= 0 && outputLinesArr.length < maxLines; i--) {
+		const line = lines[i];
+		const lineBytes = Buffer.byteLength(line, "utf-8") + (outputLinesArr.length > 0 ? 1 : 0); // +1 for newline
 
 		if (outputBytesCount + lineBytes > maxBytes) {
 			truncatedBy = "bytes";
 			// Edge case: if we haven't added ANY lines yet and this line exceeds maxBytes,
 			// take the end of the line (partial)
-			if (outputLines === 0) {
-				partialLine = truncateStringToBytesFromEnd(content.slice(start, end), maxBytes);
-				outputLines = 1;
-				outputBytesCount = Buffer.byteLength(partialLine, "utf-8");
+			if (outputLinesArr.length === 0) {
+				const truncatedLine = truncateStringToBytesFromEnd(line, maxBytes);
+				outputLinesArr.unshift(truncatedLine);
+				outputBytesCount = Buffer.byteLength(truncatedLine, "utf-8");
+				lastLinePartial = true;
 			}
 			break;
 		}
 
-		outputLines++;
+		outputLinesArr.unshift(line);
 		outputBytesCount += lineBytes;
-		outputStart = start;
-		end = start - 1;
 	}
 
 	// If we exited due to line limit
-	if (outputLines >= maxLines && outputBytesCount <= maxBytes) {
+	if (outputLinesArr.length >= maxLines && outputBytesCount <= maxBytes) {
 		truncatedBy = "lines";
 	}
 
+	const outputContent = outputLinesArr.join("\n");
+	const finalOutputBytes = Buffer.byteLength(outputContent, "utf-8");
+
 	return {
-		content: partialLine ?? copyString(content.slice(outputStart, contentEnd)),
+		content: outputContent,
 		truncated: true,
 		truncatedBy,
 		totalLines,
 		totalBytes,
-		outputLines,
-		// A "\n" never splits a surrogate pair, so the lines' byte lengths add up to the output's.
-		outputBytes: outputBytesCount,
-		lastLinePartial: partialLine !== undefined,
+		outputLines: outputLinesArr.length,
+		outputBytes: finalOutputBytes,
+		lastLinePartial,
 		firstLineExceedsLimit: false,
 		maxLines,
 		maxBytes,
@@ -334,6 +292,52 @@ export function sliceHead(text: string, maxUnits: number): string {
 		: text.slice(0, end);
 }
 
+/** Returns at most the last `maxUnits` UTF-16 code units of `text`, without splitting a surrogate pair. */
+export function sliceTail(text: string, maxUnits: number): string {
+	if (maxUnits <= 0) return "";
+	const start = Math.max(0, text.length - maxUnits);
+	return isLowSurrogate(text.charCodeAt(start)) && isHighSurrogate(text.charCodeAt(start - 1))
+		? text.slice(start + 1)
+		: text.slice(start);
+}
+
+function isHighSurrogate(code: number): boolean {
+	return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+	return code >= 0xdc00 && code <= 0xdfff;
+}
+
+export interface MiddleTruncationResult {
+	/** The start and end of the content with a `…N chars truncated…` marker between them. */
+	content: string;
+	truncated: boolean;
+	/** Characters left out. */
+	removedChars: number;
+	totalBytes: number;
+	totalLines: number;
+}
+
+/**
+ * Number of lines in `content`: one per "\n"-separated line, not counting the empty one after a trailing "\n".
+ * Counted without splitting: callers truncate output that can be many megabytes to a few kilobytes, and splitting
+ * would allocate a string per line of all of it.
+ */
+function countLines(content: string): number {
+	if (content.length === 0) {
+		return 0;
+	}
+	let lines = 1;
+	for (let i = content.indexOf("\n"); i !== -1; i = content.indexOf("\n", i + 1)) {
+		lines++;
+	}
+	return content.endsWith("\n") ? lines - 1 : lines;
+}
+
+const SURROGATE = /[\ud800-\udfff]/;
+const SURROGATE_PAIRS = /[\ud800-\udbff][\udc00-\udfff]/g;
+
 /**
  * Keep the start and the end of `content`, half of `maxBytes` each, and replace the middle with a
  * `…N chars truncated…` marker, like Codex does for tool output. Cuts only at character boundaries.
@@ -364,19 +368,4 @@ export function truncateMiddle(content: string, maxBytes: number): MiddleTruncat
 		totalBytes: buf.length,
 		totalLines,
 	};
-/** Returns at most the last `maxUnits` UTF-16 code units of `text`, without splitting a surrogate pair. */
-export function sliceTail(text: string, maxUnits: number): string {
-	if (maxUnits <= 0) return "";
-	const start = Math.max(0, text.length - maxUnits);
-	return isLowSurrogate(text.charCodeAt(start)) && isHighSurrogate(text.charCodeAt(start - 1))
-		? text.slice(start + 1)
-		: text.slice(start);
-}
-
-function isHighSurrogate(code: number): boolean {
-	return code >= 0xd800 && code <= 0xdbff;
-}
-
-function isLowSurrogate(code: number): boolean {
-	return code >= 0xdc00 && code <= 0xdfff;
 }

@@ -285,7 +285,7 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 			const authProvider = getAuthProvider(entry);
 			if (authProvider) {
 				error(
-					`MCP server "${name}" uses the credentials of provider "${authProvider}". Run "${APP_NAME} auth ${command} ${authProvider}".`,
+					`MCP server "${name}" uses the credentials of provider "${authProvider}". Run "${COMMAND_NAME} auth ${command} ${authProvider}".`,
 				);
 				return 1;
 			}

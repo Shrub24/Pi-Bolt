@@ -128,6 +128,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	// being handled, and the session is idle. See checkShutdownRequested().
 	let shutdownRequested = false;
 	let shuttingDown = false;
+	const signalCleanupHandlers: Array<() => void> = [];
 	let inputReady = false;
 	let activeCommands = 0;
 	// SIGTERM/SIGHUP received so far. Only a repeated signal forces exit during shutdown.

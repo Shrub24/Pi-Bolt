@@ -480,6 +480,9 @@ describe("numbers", () => {
 				expect(validator.check(wrap(v)), `${JSON.stringify(schema)} ${v}`).toBe(false);
 			}
 		}
+	});
+});
+
 describe("TypeBox's JavaScript types", () => {
 	it("check Type.BigInt with its bounds, as TypeBox does", () => {
 		const schema = Type.Union([Type.BigInt({ minimum: 0n }), Type.Null()]);
